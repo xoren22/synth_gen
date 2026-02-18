@@ -7,7 +7,7 @@ os.environ.setdefault("NUMBA_NUM_THREADS", "1")
 from tqdm import tqdm
 import torch, numpy as np
 from numba import njit, prange
-from helper import RadarSample
+from models import RadarSample
 from normal_parser import precompute_wall_angles_pca
 from concurrent.futures import ThreadPoolExecutor
 import multiprocessing as _mp

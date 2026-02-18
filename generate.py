@@ -12,7 +12,7 @@ import json
 import datetime
 
 from approx import Approx
-from helper import RadarSample
+from models import RadarSample
 from room_generator import generate_floor_scene
 
 
@@ -82,7 +82,7 @@ def _reserve_sample_dir(samples_dir: str, start_idx: int) -> str:
     """
     idx = int(max(0, start_idx))
     while True:
-        name = f"s{idx:12d}"
+        name = f"s{idx:012d}"
         path = os.path.join(samples_dir, name)
         try:
             os.makedirs(path, exist_ok=False)

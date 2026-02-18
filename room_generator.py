@@ -213,17 +213,9 @@ def unit(vx, vy):
     return (vx / n, vy / n)
 
 def sample_frequency_mhz(seed: int | None = None, freq_min: int | None = None, freq_max: int | None = None) -> int:
-    """
-    Return a frequency in MHz.
-    If freq_min and freq_max are provided, sample uniformly from [freq_min, freq_max].
-    Otherwise, sample from {868, 1800, 3500}.
-    Deterministic for a given seed.
-    """
+    """Return a frequency in MHz sampled uniformly from [freq_min, freq_max]"""
     rng = np.random.default_rng(seed if seed is not None else int(np.random.SeedSequence().entropy))
-    if freq_min is not None and freq_max is not None:
-        return int(rng.integers(freq_min, freq_max + 1))
-    choices = np.array([868, 1800, 3500], dtype=np.int64)
-    return int(rng.choice(choices))
+    return int(rng.integers(freq_min, freq_max + 1))
 
 def sample_antenna_location(wall_mask: np.ndarray, seed: int | None = None) -> tuple:
     """
@@ -242,7 +234,6 @@ def euclidean_distance_map(H: int, W: int, x: int, y: int) -> np.ndarray:
     yy, xx = np.indices((H, W))
     return np.sqrt((xx - float(x))**2 + (yy - float(y))**2, dtype=np.float32)
 
-# ---------------- Generator + metadata ----------------
 
 def sample_canvas_size(seed: int) -> tuple:
     """
@@ -392,8 +383,7 @@ def generate_floor_scene(width_m=None, height_m=None, px_per_m=4, seed=None, fre
         ops.append(dict(op="carve_corridor_link", p0=(int(cx), int(cy)), p1=(int(tx), int(ty)), width_px=float(corridor_w)))
 
     # ---- Partitioning with spatially varying heavy-tailed threshold per region ----
-    inner = (int(ext_th + px_per_m * 0.6), int(ext_th + px_per_m * 0.6),
-             W - int(ext_th + px_per_m * 0.6) - 1, H - int(ext_th + px_per_m * 0.6) - 1)
+    inner = (int(ext_th + px_per_m * 0.6), int(ext_th + px_per_m * 0.6), W - int(ext_th + px_per_m * 0.6) - 1, H - int(ext_th + px_per_m * 0.6) - 1)
     stack = [inner]
     splits_drawn = 0
     # Scale partition budget with canvas area to keep density roughly stable
