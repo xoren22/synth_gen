@@ -4,11 +4,14 @@
 #
 # Keeps: minimum room width logic, doors, normals, metadata, "New floor" button.
 
-import json, math, os
+import json, math, os, logging, time
 from dataclasses import dataclass, field
 from typing import List, Dict, Any
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy.ndimage import binary_closing, binary_erosion, label, binary_dilation, generate_binary_structure
+
+_log = logging.getLogger(__name__)
 
 # ---------------- Raster canvas with normals ----------------
 
@@ -155,52 +158,19 @@ class RasterCanvas:
 def closing(binmask, r=1):
     if r <= 0:
         return binmask.copy()
-    H, W = binmask.shape
-    # dilation
-    out = np.zeros_like(binmask, dtype=bool)
-    for dy in range(-r, r + 1):
-        ys = slice(max(0, dy), H + min(0, dy))
-        yd = slice(max(0, -dy), H + min(0, -dy))
-        for dx in range(-r, r + 1):
-            xs = slice(max(0, dx), W + min(0, dx))
-            xd = slice(max(0, -dx), W + min(0, -dx))
-            out[yd, xd] |= binmask[ys, xs]
-    dil = out
-    # erosion
-    out2 = np.ones_like(binmask, dtype=bool)
-    for dy in range(-r, r + 1):
-        ys = slice(max(0, dy), H + min(0, dy))
-        yd = slice(max(0, -dy), H + min(0, -dy))
-        for dx in range(-r, r + 1):
-            xs = slice(max(0, dx), W + min(0, dx))
-            xd = slice(max(0, -dx), W + min(0, -dx))
-            out2[yd, xd] &= dil[ys, xs]
-    return out2
+    structure = np.ones((2 * r + 1, 2 * r + 1), dtype=bool)
+    dil = binary_dilation(binmask, structure=structure, border_value=0)
+    return binary_erosion(dil, structure=structure, border_value=1).astype(bool, copy=False)
 
 def connected_components(binmask):
-    H, W = binmask.shape
-    labels = np.full((H, W), -1, dtype=np.int32)
-    comp_id = 0
-    sizes = {}
-    for y in range(H):
-        for x in range(W):
-            if binmask[y, x] and labels[y, x] == -1:
-                qx = [x]; qy = [y]
-                labels[y, x] = comp_id
-                size = 1
-                head = 0
-                while head < len(qx):
-                    cx, cy = qx[head], qy[head]
-                    head += 1
-                    for dx, dy in ((1,0),(-1,0),(0,1),(0,-1)):
-                        nx = cx + dx; ny = cy + dy
-                        if 0 <= nx < W and 0 <= ny < H:
-                            if binmask[ny, nx] and labels[ny, nx] == -1:
-                                labels[ny, nx] = comp_id
-                                qx.append(nx); qy.append(ny)
-                                size += 1
-                sizes[comp_id] = size
-                comp_id += 1
+    cross = generate_binary_structure(2, 1)  # 4-connected
+    labeled, n_comp = label(binmask, structure=cross)
+    # Shift labels so background is -1 and components start at 0
+    labels = labeled.astype(np.int32) - 1  # background 0 → -1, comp 1 → 0, etc.
+    if n_comp == 0:
+        return labels, {}
+    ids, counts = np.unique(labels, return_counts=True)
+    sizes = {int(cid): int(cnt) for cid, cnt in zip(ids, counts) if cid >= 0}
     return labels, sizes
 
 def line_length(p0, p1):
@@ -272,6 +242,7 @@ def sample_canvas_size(seed: int) -> tuple:
     return width_m, height_m
 
 def generate_floor_scene(width_m=None, height_m=None, px_per_m=4, seed=None, freq_min=None, freq_max=None):
+    _t_scene_start = time.perf_counter()
     if seed is None:
         seed = int(np.random.SeedSequence().entropy)
     rng = np.random.default_rng(seed)
@@ -322,13 +293,17 @@ def generate_floor_scene(width_m=None, height_m=None, px_per_m=4, seed=None, fre
                        min_room_w_m=min_room_w_m, alpha=alpha, base_area_m2=base_area_m2,
                        ln_sigma=ln_sigma))
 
+    _t0 = time.perf_counter()
     # ---- Footprint ----
     round_r = float(rng.uniform(0.0, 6.0) * px_per_m if rng.random() < 0.65 else 0.0)
     canvas.paint_rect_border(2, 2, W-3, H-3, ext_th, rounded_r_px=int(round_r))
     strokes.append(dict(kind="rect_border", layer="exterior", x0=2, y0=2, x1=W-3, y1=H-3, width_px=ext_th, rounded_r_px=int(round_r)))
 
+    _t_footprint = time.perf_counter() - _t0
+
     # removed unused variable 'inset'
 
+    _t0 = time.perf_counter()
     # ---- Cores ----
     n_cores = int(rng.integers(1, 4))
     core_rects = []
@@ -343,6 +318,9 @@ def generate_floor_scene(width_m=None, height_m=None, px_per_m=4, seed=None, fre
         canvas.paint_rect_border(*rect, core_th, rounded_r_px=int(rng.uniform(0, 2.0) * px_per_m))
         strokes.append(dict(kind="rect_border", layer="core", x0=int(rect[0]), y0=int(rect[1]), x1=int(rect[2]), y1=int(rect[3]), width_px=float(core_th)))
 
+    _t_cores = time.perf_counter() - _t0
+
+    _t0 = time.perf_counter()
     # ---- Corridor ring ----
     rx0 = int(2 + belt_offset); ry0 = int(2 + belt_offset)
     rx1 = int(W - 3 - belt_offset); ry1 = int(H - 3 - belt_offset)
@@ -382,6 +360,9 @@ def generate_floor_scene(width_m=None, height_m=None, px_per_m=4, seed=None, fre
         canvas._paint_segment((cx, cy), (tx, ty), corridor_w, set_wall=False, mark_corridor=True)
         ops.append(dict(op="carve_corridor_link", p0=(int(cx), int(cy)), p1=(int(tx), int(ty)), width_px=float(corridor_w)))
 
+    _t_corridors = time.perf_counter() - _t0
+
+    _t0 = time.perf_counter()
     # ---- Partitioning with spatially varying heavy-tailed threshold per region ----
     inner = (int(ext_th + px_per_m * 0.6), int(ext_th + px_per_m * 0.6), W - int(ext_th + px_per_m * 0.6) - 1, H - int(ext_th + px_per_m * 0.6) - 1)
     stack = [inner]
@@ -489,6 +470,9 @@ def generate_floor_scene(width_m=None, height_m=None, px_per_m=4, seed=None, fre
             stack.append((x0, y0, x1, s)); stack.append((x0, s, x1, y1))
         splits_drawn += 1
 
+    _t_partitioning = time.perf_counter() - _t0
+
+    _t0 = time.perf_counter()
     # Clean
     canvas.wall = closing(canvas.wall, r=1)
 
@@ -542,7 +526,9 @@ def generate_floor_scene(width_m=None, height_m=None, px_per_m=4, seed=None, fre
                 carve_capsule(door_center, (txu, tyu), L_px=clear_m*px_per_m, R_px=corridor_wall_th*0.7 + 1.5)
 
     add_corridor_seed_doors()
+    _t_corridor_doors = time.perf_counter() - _t0
 
+    _t0 = time.perf_counter()
     # Ensure most rooms have at least one door
     def ensure_room_doors():
         space = ~canvas.wall
@@ -557,24 +543,8 @@ def generate_floor_scene(width_m=None, height_m=None, px_per_m=4, seed=None, fre
             if np.random.random() < 0.03:  # rare doorless
                 continue
             mask_room = labels == cid
-            bd = np.zeros_like(mask_room, dtype=bool)
-            for dy in (-1,0,1):
-                for dx in (-1,0,1):
-                    if dx==0 and dy==0: continue
-                    ys = slice(max(0, dy), H + min(0, dy))
-                    yd = slice(max(0, -dy), H + min(0, -dy))
-                    xs = slice(max(0, dx), W + min(0, dx))
-                    xd = slice(max(0, -dx), W + min(0, -dx))
-                    bd[yd, xd] |= mask_room[ys, xs]
-            bd &= ~mask_room
-            near_room = bd
-            near_corr = np.zeros_like(mask_room, dtype=bool)
-            for dy,dx in ((1,0),(-1,0),(0,1),(0,-1)):
-                ys = slice(max(0, dy), H + min(0, dy))
-                yd = slice(max(0, -dy), H + min(0, -dy))
-                xs = slice(max(0, dx), W + min(0, dx))
-                xd = slice(max(0, -dx), W + min(0, -dx))
-                near_corr[yd, xd] |= canvas.corridor_mask[ys, xs]
+            near_room = binary_dilation(mask_room, structure=np.ones((3, 3), dtype=bool)) & ~mask_room
+            near_corr = binary_dilation(canvas.corridor_mask, structure=generate_binary_structure(2, 1))
             candidate = canvas.wall & near_room & near_corr
             ys, xs = np.where(candidate)
             if len(xs) == 0:
@@ -609,8 +579,13 @@ def generate_floor_scene(width_m=None, height_m=None, px_per_m=4, seed=None, fre
             canvas._paint_segment(p0, p1, 2*(corridor_wall_th*0.7 + 1.5), set_wall=False)
 
     ensure_room_doors()
+    _t_room_doors = time.perf_counter() - _t0
 
+    _t0 = time.perf_counter()
     canvas.wall = closing(canvas.wall, r=1)
+    _t_closing2 = time.perf_counter() - _t0
+
+    _t0 = time.perf_counter()
     canvas.nx[~canvas.wall] = 0.0
     canvas.ny[~canvas.wall] = 0.0
 
@@ -646,7 +621,9 @@ def generate_floor_scene(width_m=None, height_m=None, px_per_m=4, seed=None, fre
         frequency_mhz=int(freq_MHz)
     )
     normals = np.stack([canvas.nx, canvas.ny], axis=-1).astype(np.float32)
+    _t_antenna_normals = time.perf_counter() - _t0
 
+    _t0 = time.perf_counter()
     # ---- Reflectance and transmittance maps (for wall pixels) ----
     wall_mask = canvas.wall
     reflectance = np.zeros_like(wall_mask, dtype=np.float32)
@@ -720,6 +697,17 @@ def generate_floor_scene(width_m=None, height_m=None, px_per_m=4, seed=None, fre
                 trans_val = float(np.clip(base_trans * tf_factor, 0.1, 20.0))
                 transmittance[wm] = trans_val
 
+    _t_materials = time.perf_counter() - _t0
+    _t_scene_total = time.perf_counter() - _t_scene_start
+    _log.debug(
+        "generate_floor_scene [%dx%d] total=%.4fs | footprint=%.4fs cores=%.4fs "
+        "corridors=%.4fs partitioning=%.4fs closing+doors=%.4fs(corr_doors=%.4fs "
+        "room_doors=%.4fs closing2=%.4fs) antenna+normals=%.4fs materials=%.4fs",
+        W, H, _t_scene_total, _t_footprint, _t_cores, _t_corridors,
+        _t_partitioning, _t_corridor_doors + _t_room_doors + _t_closing2,
+        _t_corridor_doors, _t_room_doors, _t_closing2,
+        _t_antenna_normals, _t_materials
+    )
     return canvas.wall, normals, scene, reflectance, transmittance, dist_map
 
 # ---------------- UI + save ----------------

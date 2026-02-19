@@ -10,6 +10,8 @@ import time
 
 import json
 import datetime
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 from approx import Approx
 from models import RadarSample
@@ -43,7 +45,7 @@ def _export_sample_npz_json(out_root: str, sample_name: str, arrays: dict, metad
 			raise TypeError(f"Array value for key '{key}' must be a numpy array or tensor, got {type(val)}")
 
 	with open(npz_path, "wb") as f:
-		np.savez_compressed(f, **np_arrays)
+		np.savez(f, **np_arrays)
 	with open(json_path, "w") as f:
 		json.dump(metadata, f, indent=2)
 	return npz_path, json_path
@@ -129,6 +131,54 @@ def build_sample_from_generated(mask, normals, scene, reflectance, transmittance
 
 
 
+def _generate_one(args_tuple):
+	"""Top-level function for ProcessPoolExecutor: generate a single floor scene."""
+	seed_i, freq_min, freq_max = args_tuple
+	if seed_i is not None:
+		np.random.seed(seed_i)
+	return generate_floor_scene(seed=seed_i, freq_min=freq_min, freq_max=freq_max)
+
+
+def _submit_generation_batch(gen_pool, batch_indices, seed_base, freq_min, freq_max):
+	"""Submit a batch of generation tasks as individual futures for pipelining."""
+	futures = []
+	for gidx in batch_indices:
+		seed_i = int(seed_base) + int(gidx)
+		futures.append(gen_pool.submit(_generate_one, (seed_i, freq_min, freq_max)))
+	return futures
+
+
+def _export_batch(batch_data, preds_data, samples_dir_path, start_idx):
+	"""Export a batch of samples to disk. Runs in a background thread."""
+	export_time = 0.0
+	for (sample, mask, normals, refl, trans, dist, scene, gidx), pred_t in zip(batch_data, preds_data):
+		pred = pred_t.cpu().numpy() if hasattr(pred_t, 'cpu') else np.array(pred_t)
+		freq_mhz = int(scene.get('frequency_mhz', 1800))
+		sample_name = _reserve_sample_dir(samples_dir_path, gidx)
+		arrays = {
+			'normals': normals.astype(np.float16, copy=False),
+			'reflectance': refl.astype(np.float16, copy=False),
+			'transmittance': trans.astype(np.float16, copy=False),
+			'mask': mask.astype(np.uint8, copy=False),
+			'pathloss': pred.astype(np.float16, copy=False),
+		}
+		canvas = scene.get('canvas', {})
+		metadata = {
+			'sample_name': sample_name,
+			'shape_hw': [int(sample.H), int(sample.W)],
+			'pixel_size_m': float(sample.pixel_size),
+			'antenna': {'x_px': int(sample.x_ant), 'y_px': int(sample.y_ant)},
+			'frequency_mhz': int(freq_mhz),
+			'canvas': {'width_m': float(canvas.get('width_m', 0.0)), 'height_m': float(canvas.get('height_m', 0.0))},
+			'created_at_unix_s': float(time.time()),
+		}
+		t_e = time.perf_counter()
+		_export_sample_npz_json(samples_dir_path, sample_name, arrays, metadata)
+		export_time += time.perf_counter() - t_e
+	return export_time
+
+
+
 def main():
 	import argparse
 	logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
@@ -141,15 +191,22 @@ def main():
 	parser.add_argument('--seed', type=int, default=None, help='Base seed for deterministic generation (per-sample: seed+index)')
 	parser.add_argument('--run_id', type=str, default=None, help='Unique run identifier; auto-generated if omitted')
 	parser.add_argument('--out_root', type=str, default=None, help='Root directory for streamed outputs (default: ~/synth_gen/data/synthetic)')
-	parser.add_argument('--freq_min', type=int, default=None, help='Minimum frequency in MHz for uniform sampling')
-	parser.add_argument('--freq_max', type=int, default=None, help='Maximum frequency in MHz for uniform sampling')
+	parser.add_argument('--freq_min', type=int, default=400, help='Minimum frequency in MHz for uniform sampling')
+	parser.add_argument('--freq_max', type=int, default=10_000, help='Maximum frequency in MHz for uniform sampling')
+	parser.add_argument('--verbose', action='store_true', help='Enable detailed per-step timing logs (DEBUG level)')
 	args = parser.parse_args()
+
+	if args.verbose:
+		logging.getLogger().setLevel(logging.DEBUG)
+		# Suppress noisy third-party debug logs
+		for name in ('numba', 'llvmlite', 'matplotlib'):
+			logging.getLogger(name).setLevel(logging.WARNING)
 
 	N = int(max(1, args.num))
 	B = int(max(1, args.batch_size))
 
 	# Threads backend is always used
-	chosen_numba_threads = args.numba_threads if (args.numba_threads and args.numba_threads > 0) else 1
+	chosen_numba_threads = int(args.numba_threads) if (args.numba_threads and args.numba_threads > 0) else 0
 	chosen_workers = int(max(1, args.workers))
 
 	# Resolve output root for streaming pipeline
@@ -170,87 +227,114 @@ def main():
 	global_idx = 0
 	samples_dir = out_dir
 	os.makedirs(samples_dir, exist_ok=True)
+	sample_logger = logging.getLogger('generate.sample')
 	# Running totals across all batches
 	tot_gen = 0.0
 	tot_build_sample = 0.0
 	tot_predict = 0.0
 	tot_export = 0.0
 
-	for start in tqdm(range(0, N, B), desc='Batches'):
+	cpu_count = mp.cpu_count() or 2
+	gen_pool_size = min(B, max(1, cpu_count // 2))
+	gen_pool = ProcessPoolExecutor(max_workers=gen_pool_size, mp_context=mp.get_context('spawn'))
+	export_pool = ThreadPoolExecutor(max_workers=2)
+
+	batch_starts = list(range(0, N, B))
+	pending_export_futures = []
+
+	# Determine seed base once
+	if args.seed is not None:
+		seed_base = int(args.seed)
+	else:
+		seed_base = int(np.random.SeedSequence().generate_state(1, dtype=np.uint32)[0])
+
+	# Pre-submit first batch generation so it overlaps with nothing initially,
+	# then subsequent batches overlap generation with predict/export.
+	first_end = min(B, N)
+	current_gen_futures = _submit_generation_batch(
+		gen_pool, list(range(0, first_end)), seed_base, args.freq_min, args.freq_max
+	)
+
+	for batch_idx, start in enumerate(tqdm(batch_starts, desc='Batches')):
 		end = min(start + B, N)
-		batch = []  # (sample, mask, normals, refl, trans, dist, scene, gidx)
-		# Per-batch accumulators
-		batch_gen = 0.0
 		batch_build = 0.0
 		batch_predict = 0.0
 		batch_export = 0.0
-		for _ in range(start, end):
-			# Generation
-			t0 = time.perf_counter()
-			if args.seed is not None:
-				seed_i = int(args.seed) + int(global_idx)
-				# Ensure determinism for any np.random.* calls inside generator
-				np.random.seed(seed_i)
-				mask, normals, scene, refl, trans, dist = generate_floor_scene(
-					seed=seed_i, freq_min=args.freq_min, freq_max=args.freq_max)
-			else:
-				mask, normals, scene, refl, trans, dist = generate_floor_scene(
-					freq_min=args.freq_min, freq_max=args.freq_max)
-			batch_gen += (time.perf_counter() - t0)
 
-			building_id = global_idx
+		# Collect current batch generation results
+		t0 = time.perf_counter()
+		gen_results = [f.result() for f in current_gen_futures]
+		batch_gen = time.perf_counter() - t0
 
-			# Build sample aligned with approx.py expectations
-			t0 = time.perf_counter()
-			sample = build_sample_from_generated(mask, normals, scene, refl, trans, dist, building_id=building_id)
-			batch_build += (time.perf_counter() - t0)
-			batch.append((sample, mask, normals, refl, trans, dist, scene, global_idx))
-			global_idx += 1
+		# Pre-submit next batch generation before predict/export (true pipelining)
+		if batch_idx + 1 < len(batch_starts):
+			next_start = batch_starts[batch_idx + 1]
+			next_end = min(next_start + B, N)
+			current_gen_futures = _submit_generation_batch(
+				gen_pool, list(range(next_start, next_end)), seed_base, args.freq_min, args.freq_max
+			)
+		else:
+			current_gen_futures = []
+
+		# Build samples
+		batch = []
+		t0 = time.perf_counter()
+		for i, (mask, normals, scene, refl, trans, dist) in enumerate(gen_results):
+			gidx = start + i
+			sample = build_sample_from_generated(mask, normals, scene, refl, trans, dist, building_id=gidx)
+			sample_logger.debug(
+				"sample #%d [%dx%d]: built",
+				gidx, mask.shape[1], mask.shape[0]
+			)
+			batch.append((sample, mask, normals, refl, trans, dist, scene, gidx))
+		batch_build = time.perf_counter() - t0
 
 		# Predict for this batch
 		samples = [t[0] for t in batch]
 		t0 = time.perf_counter()
 		preds = model.predict(samples, num_workers=chosen_workers, numba_threads=chosen_numba_threads, backend='threads')
-		batch_predict += (time.perf_counter() - t0)
-		for (sample, mask, normals, refl, trans, dist, scene, gidx), pred_t in zip(batch, preds):
-			pred = pred_t.cpu().numpy() if hasattr(pred_t, 'cpu') else np.array(pred_t)
-			# Save precise per-sample bundle
-			freq_mhz = int(scene.get('frequency_mhz', 1800))
-			# Reserve a unique sample directory without listing the entire folder
-			sample_name = _reserve_sample_dir(samples_dir, gidx)
-			arrays = {
-				'normals': normals.astype(np.float16, copy=False),
-				'reflectance': refl.astype(np.float16, copy=False),
-				'transmittance': trans.astype(np.float16, copy=False),
-				'mask': mask.astype(np.uint8, copy=False),
-				'pathloss': pred.astype(np.float16, copy=False),
-			}
-			canvas = scene.get('canvas', {})
-			metadata = {
-				'sample_name': sample_name,
-				'shape_hw': [int(sample.H), int(sample.W)],
-				'pixel_size_m': float(sample.pixel_size),
-				'antenna': {'x_px': int(sample.x_ant), 'y_px': int(sample.y_ant)},
-				'frequency_mhz': int(freq_mhz),
-				'canvas': {'width_m': float(canvas.get('width_m', 0.0)), 'height_m': float(canvas.get('height_m', 0.0))},
-				'created_at_unix_s': float(time.time()),
-			}
-			t0 = time.perf_counter()
-			_export_sample_npz_json(samples_dir, sample_name, arrays, metadata)
-			batch_export += (time.perf_counter() - t0)
+		batch_predict = time.perf_counter() - t0
 
+		# Wait for any prior export to complete and collect its time
+		for fut in pending_export_futures:
+			batch_export += fut.result()
+		pending_export_futures.clear()
+
+		# Submit this batch's export asynchronously
+		export_fut = export_pool.submit(_export_batch, batch, preds, samples_dir, start)
+		pending_export_futures.append(export_fut)
+
+		global_idx = end
 		tot_gen += batch_gen
 		tot_build_sample += batch_build
 		tot_predict += batch_predict
 		tot_export += batch_export
+		batch_total = batch_gen + batch_build + batch_predict + batch_export
+		batch_count = max(1, end - start)
+		total_this_sample = batch_total / batch_count
+		total_so_far = tot_gen + tot_build_sample + tot_predict + tot_export
 		logging.info(
-			f"Batch {start//B+1}: gen={batch_gen:.3f}s, build_sample={batch_build:.3f}s, "
-			f"predict={batch_predict:.3f}s, export={batch_export:.3f}s"
+			f"Batch {batch_idx+1}: gen={batch_gen:.3f}s, build_sample={batch_build:.3f}s, "
+			f"predict={batch_predict:.3f}s, export={batch_export:.3f}s, total_this_sample={total_this_sample:.3f}s"
 		)
 		logging.info(
 			f"Totals so far ({end}/{N}): gen={tot_gen:.3f}s, build_sample={tot_build_sample:.3f}s, "
-			f"predict={tot_predict:.3f}s, export={tot_export:.3f}s"
+			f"predict={tot_predict:.3f}s, export={tot_export:.3f}s, total_so_far={total_so_far:.3f}s"
 		)
+
+	# Wait for final export
+	for fut in pending_export_futures:
+		tot_export += fut.result()
+	pending_export_futures.clear()
+
+	gen_pool.shutdown(wait=False)
+	export_pool.shutdown(wait=True)
+
+	logging.info(
+		f"Final totals ({N}/{N}): gen={tot_gen:.3f}s, build_sample={tot_build_sample:.3f}s, "
+		f"predict={tot_predict:.3f}s, export={tot_export:.3f}s, "
+		f"total_so_far={tot_gen + tot_build_sample + tot_predict + tot_export:.3f}s"
+	)
 
 
 if __name__ == "__main__":

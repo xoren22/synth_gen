@@ -2,8 +2,9 @@ import os
 os.environ.setdefault("NUMBA_THREADING_LAYER", "tbb")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
-os.environ.setdefault("NUMBA_NUM_THREADS", "1")
 
+import logging
+import time
 from tqdm import tqdm
 import torch, numpy as np
 from numba import njit, prange
@@ -11,6 +12,8 @@ from models import RadarSample
 from normal_parser import precompute_wall_angles_pca
 from concurrent.futures import ThreadPoolExecutor
 import multiprocessing as _mp
+
+logger = logging.getLogger(__name__)
 
 _WARMED_UP = False
 
@@ -148,13 +151,13 @@ def _backfill_diffuse_residual(out: np.ndarray, cnt: np.ndarray, x_ant: float, y
     return out2.astype(np.float32)
 
 
-@njit(cache=False)
+@njit(parallel=True, cache=False)
 def _backfill_direct_los(out: np.ndarray, cnt: np.ndarray, trans_mat: np.ndarray, x_ant: float, y_ant: float, pixel_size: float, freq_MHz: float, max_loss: float) -> np.ndarray:
     h, w = out.shape
     out2 = out.copy()
     mask0 = (cnt == 0)
 
-    for py in range(h):
+    for py in prange(h):
         for px in range(w):
             if not mask0[py, px]:
                 continue
@@ -453,6 +456,10 @@ def _warmup_numba_once():
         radial_step=1.0,
         use_fspl_lut=True
     )
+    # Warm up parallel backfill (recompiles with parallel=True)
+    out_w = np.full((h, w), 32000.0, np.float32)
+    cnt_w = np.zeros((h, w), np.float32)
+    _backfill_direct_los(out_w, cnt_w, trans, 4.0, 4.0, 0.25, 1000.0, 32000.0)
     _WARMED_UP = True
 
 # ---------------------------------------------------------------------#
@@ -465,13 +472,24 @@ class Approx:
 
     def approximate(self, sample: RadarSample,
                     max_trans=MAX_TRANS, max_refl=MAX_REFL):
+        t_start = time.perf_counter()
+
+        t0 = time.perf_counter()
         ref, trans, _ = sample.input_img.cpu().numpy()
         x, y, f = sample.x_ant, sample.y_ant, sample.freq_MHz
+        t_extract = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
         nx_img, ny_img = _normals_from_sample(sample, ref, trans)
+        t_normals = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
         ref_c  = np.ascontiguousarray(ref, dtype=np.float64)
         trans_c = np.ascontiguousarray(trans, dtype=np.float64)
+        t_contiguous = time.perf_counter() - t0
 
         if self.method == 'combined':
+            t0 = time.perf_counter()
             feat, cnt = calculate_combined_loss_with_normals(
                 ref_c, trans_c, nx_img, ny_img,
                 x, y, f,
@@ -481,13 +499,34 @@ class Approx:
                 radial_step=1.0,
                 use_fspl_lut=True
             )
+            t_raytrace = time.perf_counter() - t0
+
+            t0 = time.perf_counter()
             feat = apply_backfill(feat, cnt, x, y, 0.25, f, 32000.0, BACKFILL_METHOD, BACKFILL_PARAMS, trans_mat=trans_c)
+            t_backfill = time.perf_counter() - t0
         else:
+            t0 = time.perf_counter()
             feat, cnt = calculate_transmission_loss_numpy(trans_c, x, y, f, n_angles=360*128, max_walls=max_trans)
+            t_raytrace = time.perf_counter() - t0
+
+            t0 = time.perf_counter()
             feat = feat.astype(np.float32)
             feat = apply_backfill(feat, cnt.astype(np.float32), x, y, 0.25, f, 32000.0, BACKFILL_METHOD, BACKFILL_PARAMS, trans_mat=trans_c)
+            t_backfill = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
         feat = np.minimum(feat, 32000.0)
-        return torch.from_numpy(np.floor(feat))
+        result = torch.from_numpy(np.floor(feat))
+        t_finalize = time.perf_counter() - t0
+
+        t_total = time.perf_counter() - t_start
+        logger.debug(
+            "approximate [%dx%d] total=%.4fs | extract=%.4fs normals=%.4fs "
+            "contiguous=%.4fs raytrace=%.4fs backfill=%.4fs finalize=%.4fs",
+            sample.H, sample.W, t_total, t_extract, t_normals,
+            t_contiguous, t_raytrace, t_backfill, t_finalize
+        )
+        return result
 
     def predict(self, samples, max_trans=MAX_TRANS, max_refl=MAX_REFL, num_workers: int = 0, numba_threads: int = 0, backend: str = "threads"):
         if num_workers is None or num_workers <= 1:
@@ -522,7 +561,7 @@ def calculate_transmission_loss_numpy(trans_mat, x_ant, y_ant, freq_MHz, n_angle
     cos_v = np.cos(np.arange(n_angles)*dtheta)
     sin_v = np.sin(np.arange(n_angles)*dtheta)
 
-    for i in range(n_angles):
+    for i in prange(n_angles):
         ct, st = cos_v[i], sin_v[i]
         sum_loss = 0.0; last_val = None; wall_ct = 0; r=0.0
 
