@@ -50,20 +50,9 @@ MAX_REFL  = 5            # reflection budget for normal runs
 MAX_TRANS = 10           # transmission (wall) budget
 N_ANGLES  = 360*128      # single place to control angular resolution for combined method
 
-# Backfill configuration
-BACKFILL_METHOD = "los"     # options: "los", "diffuse", or "fspl"
-BACKFILL_PARAMS = {
-    "iters": 60,           # for diffuse
-    "lambda": 0.05,        # for diffuse
-    "alpha": 1.0,          # for diffuse
-}
 # ---------------------------------------------------------------------#
 #  NUMERIC BASICS                                                      #
 # ---------------------------------------------------------------------#
-def calculate_fspl(dist_m, freq_MHz, min_dist_m=0.125):
-    dist_clamped = np.maximum(dist_m, min_dist_m)
-    return 20.0*np.log10(dist_clamped) + 20.0*np.log10(freq_MHz) - 27.55
-
 @njit(inline='always')
 def _fspl(dist_m: float, freq_MHz: float, min_dist_m: float = 0.125) -> float:
     d = dist_m if dist_m > min_dist_m else min_dist_m
@@ -89,66 +78,9 @@ def _fspl_from_lut(lut: np.ndarray, step_index: int) -> float:
         step_index = n - 1
     return lut[step_index]
 
-@njit(inline='always')
-def _euclidean_distance(px, py, x_ant, y_ant, pixel_size=0.25):
-    return np.hypot(px - x_ant, py - y_ant) * pixel_size
-
 # ---------------------------------------------------------------------#
-#  BACKFILL (CPU, numpy)                                               #
+#  BACKFILL (LOS only)                                                 #
 # ---------------------------------------------------------------------#
-
-def _compute_fspl_field(h: int, w: int, x_ant: float, y_ant: float, pixel_size: float, freq_MHz: float, max_loss: float):
-    yy, xx = np.mgrid[0:h, 0:w]
-    d = np.hypot(xx - x_ant, yy - y_ant) * pixel_size
-    d = np.maximum(d, 0.125)
-    F = 20.0*np.log10(d) + 20.0*np.log10(freq_MHz) - 27.55
-    return np.minimum(F, max_loss).astype(np.float32)
-
-
-def _backfill_fspl(out: np.ndarray, cnt: np.ndarray, x_ant: float, y_ant: float, pixel_size: float, freq_MHz: float, max_loss: float) -> np.ndarray:
-    mask0 = (cnt == 0)
-    if not np.any(mask0):
-        return out
-    F = _compute_fspl_field(out.shape[0], out.shape[1], x_ant, y_ant, pixel_size, freq_MHz, max_loss)
-    out2 = out.copy()
-    out2[mask0] = F[mask0]
-    return np.minimum(out2, max_loss)
-
-
-def _backfill_diffuse_residual(out: np.ndarray, cnt: np.ndarray, x_ant: float, y_ant: float, pixel_size: float, freq_MHz: float, max_loss: float, *, iters: int = 60, lam: float = 0.05, alpha: float = 1.0) -> np.ndarray:
-    h, w = out.shape
-    mask0 = (cnt == 0)
-    if not np.any(mask0):
-        return out
-
-    F = _compute_fspl_field(h, w, x_ant, y_ant, pixel_size, freq_MHz, max_loss)
-    R = (out.astype(np.float32) - F).astype(np.float32)
-
-    cnt_f = cnt.astype(np.float32)
-    cmax = float(cnt_f.max()) if cnt_f.size > 0 else 1.0
-    norm = cnt_f / (cmax + 1e-6)
-    wL = 1.0 + alpha * np.pad(norm[:, 1:], ((0,0),(0,1)), mode='constant')
-    wR = 1.0 + alpha * np.pad(norm[:, :-1], ((0,0),(1,0)), mode='constant')
-    wU = 1.0 + alpha * np.pad(norm[1:, :], ((0,1),(0,0)), mode='constant')
-    wD = 1.0 + alpha * np.pad(norm[:-1, :], ((1,0),(0,0)), mode='constant')
-
-    for _ in range(iters):
-        R_left  = np.pad(R[:, :-1], ((0,0),(1,0)), mode='edge')
-        R_right = np.pad(R[:, 1:],  ((0,0),(0,1)), mode='edge')
-        R_up    = np.pad(R[:-1, :], ((1,0),(0,0)), mode='edge')
-        R_down  = np.pad(R[1:, :],  ((0,1),(0,0)), mode='edge')
-
-        num = wL * R_left + wR * R_right + wU * R_up + wD * R_down
-        den = (wL + wR + wU + wD) + lam
-        R_new = R.copy()
-        R_new[mask0] = (num[mask0] / den[mask0]).astype(np.float32)
-        R = R_new
-
-    out2 = F + R
-    out2 = np.maximum(out2, F)
-    out2 = np.minimum(out2, max_loss)
-    out2[~mask0] = out[~mask0]
-    return out2.astype(np.float32)
 
 
 @njit(parallel=True, cache=False)
@@ -230,22 +162,10 @@ def _backfill_direct_los(out: np.ndarray, cnt: np.ndarray, trans_mat: np.ndarray
     return out2.astype(np.float32)
 
 
-def apply_backfill(out: np.ndarray, cnt: np.ndarray, x_ant: float, y_ant: float, pixel_size: float, freq_MHz: float, max_loss: float, method: str = BACKFILL_METHOD, params: dict | None = None, *, trans_mat: np.ndarray | None = None) -> np.ndarray:
-    if params is None:
-        params = BACKFILL_PARAMS
-    if method == "fspl":
-        return _backfill_fspl(out, cnt, x_ant, y_ant, pixel_size, freq_MHz, max_loss)
-    elif method == "diffuse":
-        iters = int(params.get("iters", 60))
-        lam   = float(params.get("lambda", 0.05))
-        alpha = float(params.get("alpha", 1.0))
-        return _backfill_diffuse_residual(out, cnt, x_ant, y_ant, pixel_size, freq_MHz, max_loss, iters=iters, lam=lam, alpha=alpha)
-    elif method == "los":
-        if trans_mat is None:
-            raise ValueError("LOS backfill requires trans_mat")
-        return _backfill_direct_los(out, cnt, trans_mat, x_ant, y_ant, pixel_size, freq_MHz, max_loss)
-    else:
-        return _backfill_fspl(out, cnt, x_ant, y_ant, pixel_size, freq_MHz, max_loss)
+def apply_backfill(out: np.ndarray, cnt: np.ndarray, x_ant: float, y_ant: float, pixel_size: float, freq_MHz: float, max_loss: float, *, trans_mat: np.ndarray | None = None) -> np.ndarray:
+    if trans_mat is None:
+        raise ValueError("LOS backfill requires trans_mat")
+    return _backfill_direct_los(out, cnt, trans_mat, x_ant, y_ant, pixel_size, freq_MHz, max_loss)
 
 # ---------------------------------------------------------------------#
 #  STEP-UNTIL-WALL                                                     #
@@ -502,7 +422,7 @@ class Approx:
             t_raytrace = time.perf_counter() - t0
 
             t0 = time.perf_counter()
-            feat = apply_backfill(feat, cnt, x, y, 0.25, f, 32000.0, BACKFILL_METHOD, BACKFILL_PARAMS, trans_mat=trans_c)
+            feat = apply_backfill(feat, cnt, x, y, 0.25, f, 32000.0, trans_mat=trans_c)
             t_backfill = time.perf_counter() - t0
         else:
             t0 = time.perf_counter()
@@ -511,7 +431,7 @@ class Approx:
 
             t0 = time.perf_counter()
             feat = feat.astype(np.float32)
-            feat = apply_backfill(feat, cnt.astype(np.float32), x, y, 0.25, f, 32000.0, BACKFILL_METHOD, BACKFILL_PARAMS, trans_mat=trans_c)
+            feat = apply_backfill(feat, cnt.astype(np.float32), x, y, 0.25, f, 32000.0, trans_mat=trans_c)
             t_backfill = time.perf_counter() - t0
 
         t0 = time.perf_counter()
