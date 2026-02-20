@@ -45,7 +45,7 @@ def _export_sample_npz_json(out_root: str, sample_name: str, arrays: dict, metad
 			raise TypeError(f"Array value for key '{key}' must be a numpy array or tensor, got {type(val)}")
 
 	with open(npz_path, "wb") as f:
-		np.savez(f, **np_arrays)
+		np.savez_compressed(f, **np_arrays)
 	with open(json_path, "w") as f:
 		json.dump(metadata, f, indent=2)
 	return npz_path, json_path
@@ -100,11 +100,11 @@ def _reserve_sample_dir(samples_dir: str, start_idx: int) -> str:
 
 def build_sample_from_generated(mask, normals, scene, reflectance, transmittance, dist_map, building_id: int = 0):
 	H, W = mask.shape
-	# Input image channels: reflectance, transmittance, distance
-	inp = np.stack([reflectance, transmittance, dist_map], axis=0).astype(np.float32)
-	input_img = torch.from_numpy(inp)
-	# Output image unknown here; approximator will predict
-	output_img = torch.zeros((H, W), dtype=torch.float32)
+	reflectance_t = torch.from_numpy(np.ascontiguousarray(reflectance, dtype=np.float32))
+	transmittance_t = torch.from_numpy(np.ascontiguousarray(transmittance, dtype=np.float32))
+	dist_map_t = torch.from_numpy(np.ascontiguousarray(dist_map, dtype=np.float32))
+	# Pathloss is unknown before approximation; keep placeholder.
+	pathloss_t = torch.zeros((H, W), dtype=torch.float32)
 
 	ant = scene.get("antenna", {})
 	x_ant = float(ant.get("x", 0))
@@ -121,8 +121,10 @@ def build_sample_from_generated(mask, normals, scene, reflectance, transmittance
 		y_ant=y_ant,
 		azimuth=0.0,
 		freq_MHz=freq_mhz,
-		input_img=input_img,
-		output_img=output_img,
+		reflectance=reflectance_t,
+		transmittance=transmittance_t,
+		dist_map=dist_map_t,
+		pathloss=pathloss_t,
 		radiation_pattern=radiation_pattern,
 		pixel_size=0.25,
 		mask=torch.from_numpy(mask.astype(np.float32)),
@@ -187,7 +189,7 @@ def main():
 	parser.add_argument('--num', type=int, default=5, help='Number of rooms to generate and approximate')
 	parser.add_argument('--batch_size', type=int, default=96, help='Batch size for generate->predict->save streaming')
 	parser.add_argument('--numba_threads', type=int, default=1, help='Numba threads per worker (0 = auto)')
-	parser.add_argument('--workers', type=int, default=(mp.cpu_count() or 1), help='Number of workers for model.predict (1=sequential)')
+	parser.add_argument('--workers', type=int, default=max((mp.cpu_count() or 1) - 5, 1), help='Number of workers for model.predict (1=sequential)')
 	parser.add_argument('--seed', type=int, default=None, help='Base seed for deterministic generation (per-sample: seed+index)')
 	parser.add_argument('--run_id', type=str, default=None, help='Unique run identifier; auto-generated if omitted')
 	parser.add_argument('--out_root', type=str, default=None, help='Root directory for streamed outputs (default: ~/synth_gen/data/synthetic)')

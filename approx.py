@@ -18,6 +18,12 @@ logger = logging.getLogger(__name__)
 _WARMED_UP = False
 
 
+def _to_numpy_2d(arr):
+    if isinstance(arr, torch.Tensor):
+        arr = arr.detach().cpu().numpy()
+    return np.asarray(arr)
+
+
 def _normals_from_sample(sample, ref=None, trans=None):
     """Extract (nx_img, ny_img) float64 arrays from a RadarSample.
 
@@ -30,7 +36,8 @@ def _normals_from_sample(sample, ref=None, trans=None):
         ny = np.ascontiguousarray(n[..., 1], dtype=np.float64)
         return nx, ny
     if ref is None or trans is None:
-        ref, trans, _ = sample.input_img.cpu().numpy()
+        ref = _to_numpy_2d(sample.reflectance)
+        trans = _to_numpy_2d(sample.transmittance)
     building_mask = (ref + trans > 0).astype(np.uint8)
     angles = precompute_wall_angles_pca(building_mask)
     rad = np.deg2rad(angles + 90.0)
@@ -395,7 +402,8 @@ class Approx:
         t_start = time.perf_counter()
 
         t0 = time.perf_counter()
-        ref, trans, _ = sample.input_img.cpu().numpy()
+        ref = _to_numpy_2d(sample.reflectance)
+        trans = _to_numpy_2d(sample.transmittance)
         x, y, f = sample.x_ant, sample.y_ant, sample.freq_MHz
         t_extract = time.perf_counter() - t0
 

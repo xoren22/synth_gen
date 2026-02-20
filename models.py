@@ -12,8 +12,10 @@ class RadarSample:
     y_ant: float
     azimuth: float
     freq_MHz: float
-    input_img: torch.Tensor  # In format (C, H, W)
-    output_img: torch.Tensor  # In format (H, W) or (1, H, W)
+    reflectance: torch.Tensor  # (H, W)
+    transmittance: torch.Tensor  # (H, W)
+    dist_map: torch.Tensor  # (H, W)
+    pathloss: torch.Tensor  # (H, W) or (1, H, W)
     radiation_pattern: torch.Tensor
     pixel_size: float = 0.25
     mask: Union[torch.Tensor, None] = None
@@ -22,17 +24,19 @@ class RadarSample:
 
     def copy(self):
         return RadarSample(
-            self.H,
-            self.W,
-            self.x_ant,
-            self.y_ant,
-            self.azimuth,
-            self.freq_MHz,
-            self.input_img,
-            self.output_img,
-            self.radiation_pattern,
-            self.pixel_size,
-            self.mask,
-            self.ids,
-            self.normals,
+            H=self.H,
+            W=self.W,
+            x_ant=self.x_ant,
+            y_ant=self.y_ant,
+            azimuth=self.azimuth,
+            freq_MHz=self.freq_MHz,
+            reflectance=self.reflectance,
+            transmittance=self.transmittance,
+            dist_map=self.dist_map,
+            pathloss=self.pathloss,
+            radiation_pattern=self.radiation_pattern,
+            pixel_size=self.pixel_size,
+            mask=self.mask,
+            ids=self.ids,
+            normals=self.normals,
         )
