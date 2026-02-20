@@ -185,9 +185,9 @@ def main():
 
 	parser = argparse.ArgumentParser("Synthetic data generation pipeline")
 	parser.add_argument('--num', type=int, default=5, help='Number of rooms to generate and approximate')
-	parser.add_argument('--batch_size', type=int, default=10, help='Batch size for generate->predict->save streaming')
-	parser.add_argument('--numba_threads', type=int, default=0, help='Numba threads per worker (0 = auto)')
-	parser.add_argument('--workers', type=int, default=2, help='Number of workers for model.predict (1=sequential)')
+	parser.add_argument('--batch_size', type=int, default=96, help='Batch size for generate->predict->save streaming')
+	parser.add_argument('--numba_threads', type=int, default=1, help='Numba threads per worker (0 = auto)')
+	parser.add_argument('--workers', type=int, default=(mp.cpu_count() or 1), help='Number of workers for model.predict (1=sequential)')
 	parser.add_argument('--seed', type=int, default=None, help='Base seed for deterministic generation (per-sample: seed+index)')
 	parser.add_argument('--run_id', type=str, default=None, help='Unique run identifier; auto-generated if omitted')
 	parser.add_argument('--out_root', type=str, default=None, help='Root directory for streamed outputs (default: ~/synth_gen/data/synthetic)')
