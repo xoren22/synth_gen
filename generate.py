@@ -195,6 +195,8 @@ def main():
 	parser.add_argument('--out_root', type=str, default=None, help='Root directory for streamed outputs (default: ~/synth_gen/data/synthetic)')
 	parser.add_argument('--freq_min', type=int, default=400, help='Minimum frequency in MHz for uniform sampling')
 	parser.add_argument('--freq_max', type=int, default=10_000, help='Maximum frequency in MHz for uniform sampling')
+	parser.add_argument('--gen_workers', type=int, default=0, help='Max workers for room generation pool')
+	parser.add_argument('--export_workers', type=int, default=2, help='Max workers for export thread pool')
 	parser.add_argument('--verbose', action='store_true', help='Enable detailed per-step timing logs (DEBUG level)')
 	args = parser.parse_args()
 
@@ -237,9 +239,14 @@ def main():
 	tot_export = 0.0
 
 	cpu_count = mp.cpu_count() or 2
-	gen_pool_size = min(B, max(1, cpu_count // 2))
+	if args.gen_workers and args.gen_workers > 0:
+		gen_pool_size = min(B, args.gen_workers)
+	else:
+		gen_pool_size = min(B, max(1, cpu_count // 2))
+	export_workers = max(1, args.export_workers) if args.export_workers and args.export_workers > 0 else 2
 	gen_pool = ProcessPoolExecutor(max_workers=gen_pool_size, mp_context=mp.get_context('spawn'))
-	export_pool = ThreadPoolExecutor(max_workers=2)
+	export_pool = ThreadPoolExecutor(max_workers=export_workers)
+	logging.info(f"Pools: gen_workers={gen_pool_size}, export_workers={export_workers}, predict_workers={chosen_workers}, numba_threads={chosen_numba_threads or 'auto'}")
 
 	batch_starts = list(range(0, N, B))
 	pending_export_futures = []

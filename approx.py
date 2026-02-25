@@ -457,19 +457,20 @@ class Approx:
         return result
 
     def predict(self, samples, max_trans=MAX_TRANS, max_refl=MAX_REFL, num_workers: int = 0, numba_threads: int = 0, backend: str = "threads"):
+        # Set numba thread count before any code path (including sequential)
+        try:
+            import numba as _nb
+            if numba_threads and numba_threads > 0:
+                _nb.set_num_threads(numba_threads)
+            elif num_workers and num_workers > 1:
+                per = max(1, (_mp.cpu_count() or 2) // num_workers)
+                _nb.set_num_threads(per)
+        except Exception:
+            pass
         if num_workers is None or num_workers <= 1:
             return [self.approximate(s, max_trans, max_refl) for s in tqdm(samples, "predicting")]
         max_workers = num_workers if isinstance(num_workers, int) and num_workers > 0 else max(1, (_mp.cpu_count() or 2) - 1)
         if backend == "threads":
-            try:
-                import numba as _nb
-                if numba_threads and numba_threads > 0:
-                    _nb.set_num_threads(numba_threads)
-                else:
-                    per = max(1, (_mp.cpu_count() or 2) // max_workers)
-                    _nb.set_num_threads(per)
-            except Exception:
-                pass
             with ThreadPoolExecutor(max_workers=max_workers) as ex:
                 futures = [ex.submit(self.approximate, s, max_trans, max_refl) for s in samples]
                 return [f.result() for f in tqdm(futures, total=len(futures), desc="predicting")]
