@@ -11,7 +11,9 @@ import time
 import json
 import datetime
 import multiprocessing as mp
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+import queue
+import threading
 
 from approx import Approx
 from models import RadarSample
@@ -141,22 +143,32 @@ def _generate_one(args_tuple):
 	return generate_floor_scene(seed=seed_i, freq_min=freq_min, freq_max=freq_max)
 
 
-def _submit_generation_batch(gen_pool, batch_indices, seed_base, freq_min, freq_max):
-	"""Submit a batch of generation tasks as individual futures for pipelining."""
-	futures = []
-	for gidx in batch_indices:
-		seed_i = int(seed_base) + int(gidx)
-		futures.append(gen_pool.submit(_generate_one, (seed_i, freq_min, freq_max)))
-	return futures
+def _predict_worker(model, gen_queue, export_queue, numba_threads):
+	"""Worker thread: pull from gen_queue, run approximate(), push to export_queue."""
+	try:
+		import numba as _nb
+		if numba_threads and numba_threads > 0:
+			_nb.set_num_threads(numba_threads)
+	except Exception:
+		pass
+	while True:
+		item = gen_queue.get()
+		if item is None:
+			break
+		sample, mask, normals, refl, trans, dist, scene, gidx = item
+		pred = model.approximate(sample)
+		export_queue.put((sample, mask, normals, refl, trans, dist, scene, gidx, pred))
 
 
-def _export_batch(batch_data, preds_data, samples_dir_path, start_idx):
-	"""Export a batch of samples to disk. Runs in a background thread."""
-	export_time = 0.0
-	for (sample, mask, normals, refl, trans, dist, scene, gidx), pred_t in zip(batch_data, preds_data):
+def _export_worker(export_queue, samples_dir, pbar):
+	"""Worker thread: pull from export_queue, write to disk, update progress."""
+	while True:
+		item = export_queue.get()
+		if item is None:
+			break
+		sample, mask, normals, refl, trans, dist, scene, gidx, pred_t = item
 		pred = pred_t.cpu().numpy() if hasattr(pred_t, 'cpu') else np.array(pred_t)
-		freq_mhz = int(scene.get('frequency_mhz', 1800))
-		sample_name = _reserve_sample_dir(samples_dir_path, gidx)
+		sample_name = _reserve_sample_dir(samples_dir, gidx)
 		arrays = {
 			'normals': normals.astype(np.float16, copy=False),
 			'reflectance': refl.astype(np.float16, copy=False),
@@ -170,14 +182,12 @@ def _export_batch(batch_data, preds_data, samples_dir_path, start_idx):
 			'shape_hw': [int(sample.H), int(sample.W)],
 			'pixel_size_m': float(sample.pixel_size),
 			'antenna': {'x_px': int(sample.x_ant), 'y_px': int(sample.y_ant)},
-			'frequency_mhz': int(freq_mhz),
+			'frequency_mhz': int(scene.get('frequency_mhz', 1800)),
 			'canvas': {'width_m': float(canvas.get('width_m', 0.0)), 'height_m': float(canvas.get('height_m', 0.0))},
 			'created_at_unix_s': float(time.time()),
 		}
-		t_e = time.perf_counter()
-		_export_sample_npz_json(samples_dir_path, sample_name, arrays, metadata)
-		export_time += time.perf_counter() - t_e
-	return export_time
+		_export_sample_npz_json(samples_dir, sample_name, arrays, metadata)
+		pbar.update(1)
 
 
 
@@ -189,14 +199,14 @@ def main():
 	parser.add_argument('--num', type=int, default=5, help='Number of rooms to generate and approximate')
 	parser.add_argument('--batch_size', type=int, default=96, help='Batch size for generate->predict->save streaming')
 	parser.add_argument('--numba_threads', type=int, default=1, help='Numba threads per worker (0 = auto)')
-	parser.add_argument('--workers', type=int, default=max((mp.cpu_count() or 1) - 5, 1), help='Number of workers for model.predict (1=sequential)')
+	parser.add_argument('--workers', type=int, default=1, help='Number of predict worker threads (1=sequential)')
 	parser.add_argument('--seed', type=int, default=None, help='Base seed for deterministic generation (per-sample: seed+index)')
 	parser.add_argument('--run_id', type=str, default=None, help='Unique run identifier; auto-generated if omitted')
 	parser.add_argument('--out_root', type=str, default=None, help='Root directory for streamed outputs (default: ~/synth_gen/data/synthetic)')
 	parser.add_argument('--freq_min', type=int, default=400, help='Minimum frequency in MHz for uniform sampling')
 	parser.add_argument('--freq_max', type=int, default=10_000, help='Maximum frequency in MHz for uniform sampling')
-	parser.add_argument('--gen_workers', type=int, default=0, help='Max workers for room generation pool')
-	parser.add_argument('--export_workers', type=int, default=2, help='Max workers for export thread pool')
+	parser.add_argument('--gen_workers', type=int, default=1, help='Max workers for room generation pool')
+	parser.add_argument('--export_workers', type=int, default=1, help='Max workers for export thread pool')
 	parser.add_argument('--verbose', action='store_true', help='Enable detailed per-step timing logs (DEBUG level)')
 	args = parser.parse_args()
 
@@ -225,31 +235,25 @@ def main():
 	os.makedirs(out_dir, exist_ok=True)
 	logging.info(f"Run ID: {run_id}; outputs -> {out_dir}")
 
-	# Generate->predict->save in batches (save NPZ+JSON per sample)
-	logging.info(f"Processing {N} samples in batches of {B} (backend=threads, workers={chosen_workers})...")
+	# Continuous sample-level pipeline: gen -> predict -> export (no batch sync)
+	logging.info(f"Processing {N} samples continuously (workers={chosen_workers})...")
 	model = Approx()
-	global_idx = 0
 	samples_dir = out_dir
 	os.makedirs(samples_dir, exist_ok=True)
-	sample_logger = logging.getLogger('generate.sample')
-	# Running totals across all batches
-	tot_gen = 0.0
-	tot_build_sample = 0.0
-	tot_predict = 0.0
-	tot_export = 0.0
 
 	cpu_count = mp.cpu_count() or 2
 	if args.gen_workers and args.gen_workers > 0:
-		gen_pool_size = min(B, args.gen_workers)
+		gen_pool_size = min(N, args.gen_workers)
 	else:
-		gen_pool_size = min(B, max(1, cpu_count // 2))
-	export_workers = max(1, args.export_workers) if args.export_workers and args.export_workers > 0 else 2
-	gen_pool = ProcessPoolExecutor(max_workers=gen_pool_size, mp_context=mp.get_context('spawn'))
-	export_pool = ThreadPoolExecutor(max_workers=export_workers)
-	logging.info(f"Pools: gen_workers={gen_pool_size}, export_workers={export_workers}, predict_workers={chosen_workers}, numba_threads={chosen_numba_threads or 'auto'}")
+		gen_pool_size = min(N, max(1, cpu_count // 2))
+	export_worker_count = max(1, args.export_workers) if args.export_workers and args.export_workers > 0 else 2
 
-	batch_starts = list(range(0, N, B))
-	pending_export_futures = []
+	# Bounded queues limit memory growth
+	gen_queue = queue.Queue(maxsize=chosen_workers * 2)
+	export_queue = queue.Queue(maxsize=chosen_workers * 2)
+
+	gen_pool = ProcessPoolExecutor(max_workers=gen_pool_size, mp_context=mp.get_context('spawn'))
+	logging.info(f"Pools: gen_workers={gen_pool_size}, export_workers={export_worker_count}, predict_workers={chosen_workers}, numba_threads={chosen_numba_threads or 'auto'}")
 
 	# Determine seed base once
 	if args.seed is not None:
@@ -257,92 +261,63 @@ def main():
 	else:
 		seed_base = int(np.random.SeedSequence().generate_state(1, dtype=np.uint32)[0])
 
-	# Pre-submit first batch generation so it overlaps with nothing initially,
-	# then subsequent batches overlap generation with predict/export.
-	first_end = min(B, N)
-	current_gen_futures = _submit_generation_batch(
-		gen_pool, list(range(0, first_end)), seed_base, args.freq_min, args.freq_max
-	)
+	pbar = tqdm(total=N, desc='Samples')
+	t_start = time.perf_counter()
 
-	for batch_idx, start in enumerate(tqdm(batch_starts, desc='Batches')):
-		end = min(start + B, N)
-		batch_build = 0.0
-		batch_predict = 0.0
-		batch_export = 0.0
-
-		# Collect current batch generation results
-		t0 = time.perf_counter()
-		gen_results = [f.result() for f in current_gen_futures]
-		batch_gen = time.perf_counter() - t0
-
-		# Pre-submit next batch generation before predict/export (true pipelining)
-		if batch_idx + 1 < len(batch_starts):
-			next_start = batch_starts[batch_idx + 1]
-			next_end = min(next_start + B, N)
-			current_gen_futures = _submit_generation_batch(
-				gen_pool, list(range(next_start, next_end)), seed_base, args.freq_min, args.freq_max
-			)
-		else:
-			current_gen_futures = []
-
-		# Build samples
-		batch = []
-		t0 = time.perf_counter()
-		for i, (mask, normals, scene, refl, trans, dist) in enumerate(gen_results):
-			gidx = start + i
-			sample = build_sample_from_generated(mask, normals, scene, refl, trans, dist, building_id=gidx)
-			sample_logger.debug(
-				"sample #%d [%dx%d]: built",
-				gidx, mask.shape[1], mask.shape[0]
-			)
-			batch.append((sample, mask, normals, refl, trans, dist, scene, gidx))
-		batch_build = time.perf_counter() - t0
-
-		# Predict for this batch
-		samples = [t[0] for t in batch]
-		t0 = time.perf_counter()
-		preds = model.predict(samples, num_workers=chosen_workers, numba_threads=chosen_numba_threads, backend='threads')
-		batch_predict = time.perf_counter() - t0
-
-		# Wait for any prior export to complete and collect its time
-		for fut in pending_export_futures:
-			batch_export += fut.result()
-		pending_export_futures.clear()
-
-		# Submit this batch's export asynchronously
-		export_fut = export_pool.submit(_export_batch, batch, preds, samples_dir, start)
-		pending_export_futures.append(export_fut)
-
-		global_idx = end
-		tot_gen += batch_gen
-		tot_build_sample += batch_build
-		tot_predict += batch_predict
-		tot_export += batch_export
-		batch_total = batch_gen + batch_build + batch_predict + batch_export
-		batch_count = max(1, end - start)
-		total_this_sample = batch_total / batch_count
-		total_so_far = tot_gen + tot_build_sample + tot_predict + tot_export
-		logging.info(
-			f"Batch {batch_idx+1}: gen={batch_gen:.3f}s, build_sample={batch_build:.3f}s, "
-			f"predict={batch_predict:.3f}s, export={batch_export:.3f}s, total_this_sample={total_this_sample:.3f}s"
+	# Start predict worker threads
+	predict_threads = []
+	for _ in range(chosen_workers):
+		t = threading.Thread(
+			target=_predict_worker,
+			args=(model, gen_queue, export_queue, chosen_numba_threads),
+			daemon=True,
 		)
-		logging.info(
-			f"Totals so far ({end}/{N}): gen={tot_gen:.3f}s, build_sample={tot_build_sample:.3f}s, "
-			f"predict={tot_predict:.3f}s, export={tot_export:.3f}s, total_so_far={total_so_far:.3f}s"
+		t.start()
+		predict_threads.append(t)
+
+	# Start export worker threads
+	export_threads = []
+	for _ in range(export_worker_count):
+		t = threading.Thread(
+			target=_export_worker,
+			args=(export_queue, samples_dir, pbar),
+			daemon=True,
 		)
+		t.start()
+		export_threads.append(t)
 
-	# Wait for final export
-	for fut in pending_export_futures:
-		tot_export += fut.result()
-	pending_export_futures.clear()
+	# Submit all generation tasks to the process pool
+	gen_futures = {}
+	for gidx in range(N):
+		seed_i = int(seed_base) + gidx
+		fut = gen_pool.submit(_generate_one, (seed_i, args.freq_min, args.freq_max))
+		gen_futures[fut] = gidx
 
+	# Feed generated results into predict queue as they complete
+	for fut in as_completed(gen_futures):
+		gidx = gen_futures[fut]
+		mask, normals, scene, refl, trans, dist = fut.result()
+		sample = build_sample_from_generated(mask, normals, scene, refl, trans, dist, building_id=gidx)
+		gen_queue.put((sample, mask, normals, refl, trans, dist, scene, gidx))
+
+	# Signal predict workers to stop (one sentinel per worker)
+	for _ in predict_threads:
+		gen_queue.put(None)
+	for t in predict_threads:
+		t.join()
+
+	# Signal export workers to stop
+	for _ in export_threads:
+		export_queue.put(None)
+	for t in export_threads:
+		t.join()
+
+	pbar.close()
 	gen_pool.shutdown(wait=False)
-	export_pool.shutdown(wait=True)
 
+	elapsed = time.perf_counter() - t_start
 	logging.info(
-		f"Final totals ({N}/{N}): gen={tot_gen:.3f}s, build_sample={tot_build_sample:.3f}s, "
-		f"predict={tot_predict:.3f}s, export={tot_export:.3f}s, "
-		f"total_so_far={tot_gen + tot_build_sample + tot_predict + tot_export:.3f}s"
+		f"Done: {N} samples in {elapsed:.1f}s ({N/max(elapsed,0.001):.1f} samples/sec)"
 	)
 
 
