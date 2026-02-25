@@ -1,6 +1,7 @@
 import os
 # Force Numba threading layer for all runs (set before importing approx/numba)
 os.environ.setdefault("NUMBA_THREADING_LAYER", "tbb")
+os.environ.setdefault("NUMBA_NUM_THREADS", "1")  # default: disable multi-threaded numba speedup
 import logging
 import numpy as np
 import torch
@@ -10,10 +11,6 @@ import time
 
 import json
 import datetime
-import multiprocessing as mp
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-import queue
-import threading
 
 from approx import Approx
 from models import RadarSample
@@ -135,58 +132,36 @@ def build_sample_from_generated(mask, normals, scene, reflectance, transmittance
 
 
 
-def _generate_one(args_tuple):
-	"""Top-level function for ProcessPoolExecutor: generate a single floor scene."""
-	seed_i, freq_min, freq_max = args_tuple
+def _generate_one(seed_i, freq_min, freq_max):
+	"""Generate a single floor scene (sequential helper)."""
 	if seed_i is not None:
 		np.random.seed(seed_i)
 	return generate_floor_scene(seed=seed_i, freq_min=freq_min, freq_max=freq_max)
 
 
-def _predict_worker(model, gen_queue, export_queue, numba_threads):
-	"""Worker thread: pull from gen_queue, run approximate(), push to export_queue."""
-	try:
-		import numba as _nb
-		if numba_threads and numba_threads > 0:
-			_nb.set_num_threads(numba_threads)
-	except Exception:
-		pass
-	while True:
-		item = gen_queue.get()
-		if item is None:
-			break
-		sample, mask, normals, refl, trans, dist, scene, gidx = item
-		pred = model.approximate(sample)
-		export_queue.put((sample, mask, normals, refl, trans, dist, scene, gidx, pred))
-
-
-def _export_worker(export_queue, samples_dir, pbar):
-	"""Worker thread: pull from export_queue, write to disk, update progress."""
-	while True:
-		item = export_queue.get()
-		if item is None:
-			break
-		sample, mask, normals, refl, trans, dist, scene, gidx, pred_t = item
-		pred = pred_t.cpu().numpy() if hasattr(pred_t, 'cpu') else np.array(pred_t)
-		sample_name = _reserve_sample_dir(samples_dir, gidx)
-		arrays = {
-			'normals': normals.astype(np.float16, copy=False),
-			'reflectance': refl.astype(np.float16, copy=False),
-			'transmittance': trans.astype(np.float16, copy=False),
-			'mask': mask.astype(np.uint8, copy=False),
-			'pathloss': pred.astype(np.float16, copy=False),
-		}
-		canvas = scene.get('canvas', {})
-		metadata = {
-			'sample_name': sample_name,
-			'shape_hw': [int(sample.H), int(sample.W)],
-			'pixel_size_m': float(sample.pixel_size),
-			'antenna': {'x_px': int(sample.x_ant), 'y_px': int(sample.y_ant)},
-			'frequency_mhz': int(scene.get('frequency_mhz', 1800)),
-			'canvas': {'width_m': float(canvas.get('width_m', 0.0)), 'height_m': float(canvas.get('height_m', 0.0))},
-			'created_at_unix_s': float(time.time()),
-		}
-		_export_sample_npz_json(samples_dir, sample_name, arrays, metadata)
+def _export_one(sample, mask, normals, refl, trans, scene, gidx, pred_t, samples_dir, pbar=None):
+	"""Export a single predicted sample to disk (shared by threaded and sequential modes)."""
+	pred = pred_t.cpu().numpy() if hasattr(pred_t, 'cpu') else np.array(pred_t)
+	sample_name = _reserve_sample_dir(samples_dir, gidx)
+	arrays = {
+		'normals': normals.astype(np.float16, copy=False),
+		'reflectance': refl.astype(np.float16, copy=False),
+		'transmittance': trans.astype(np.float16, copy=False),
+		'mask': mask.astype(np.uint8, copy=False),
+		'pathloss': pred.astype(np.float16, copy=False),
+	}
+	canvas = scene.get('canvas', {})
+	metadata = {
+		'sample_name': sample_name,
+		'shape_hw': [int(sample.H), int(sample.W)],
+		'pixel_size_m': float(sample.pixel_size),
+		'antenna': {'x_px': int(sample.x_ant), 'y_px': int(sample.y_ant)},
+		'frequency_mhz': int(scene.get('frequency_mhz', 1800)),
+		'canvas': {'width_m': float(canvas.get('width_m', 0.0)), 'height_m': float(canvas.get('height_m', 0.0))},
+		'created_at_unix_s': float(time.time()),
+	}
+	_export_sample_npz_json(samples_dir, sample_name, arrays, metadata)
+	if pbar is not None:
 		pbar.update(1)
 
 
@@ -197,16 +172,12 @@ def main():
 
 	parser = argparse.ArgumentParser("Synthetic data generation pipeline")
 	parser.add_argument('--num', type=int, default=5, help='Number of rooms to generate and approximate')
-	parser.add_argument('--batch_size', type=int, default=96, help='Batch size for generate->predict->save streaming')
-	parser.add_argument('--numba_threads', type=int, default=1, help='Numba threads per worker (0 = auto)')
-	parser.add_argument('--workers', type=int, default=1, help='Number of predict worker threads (1=sequential)')
+	parser.add_argument('--numba_threads', type=int, default=1, help='Numba threads for prange kernels (default 1 disables multi-thread speedup)')
 	parser.add_argument('--seed', type=int, default=None, help='Base seed for deterministic generation (per-sample: seed+index)')
 	parser.add_argument('--run_id', type=str, default=None, help='Unique run identifier; auto-generated if omitted')
 	parser.add_argument('--out_root', type=str, default=None, help='Root directory for streamed outputs (default: ~/synth_gen/data/synthetic)')
 	parser.add_argument('--freq_min', type=int, default=400, help='Minimum frequency in MHz for uniform sampling')
 	parser.add_argument('--freq_max', type=int, default=10_000, help='Maximum frequency in MHz for uniform sampling')
-	parser.add_argument('--gen_workers', type=int, default=1, help='Max workers for room generation pool')
-	parser.add_argument('--export_workers', type=int, default=1, help='Max workers for export thread pool')
 	parser.add_argument('--verbose', action='store_true', help='Enable detailed per-step timing logs (DEBUG level)')
 	args = parser.parse_args()
 
@@ -217,11 +188,7 @@ def main():
 			logging.getLogger(name).setLevel(logging.WARNING)
 
 	N = int(max(1, args.num))
-	B = int(max(1, args.batch_size))
-
-	# Threads backend is always used
-	chosen_numba_threads = int(args.numba_threads) if (args.numba_threads and args.numba_threads > 0) else 0
-	chosen_workers = int(max(1, args.workers))
+	chosen_numba_threads = max(1, int(args.numba_threads)) if args.numba_threads is not None else 1
 
 	# Resolve output root for streaming pipeline
 	if args.out_root and len(str(args.out_root)) > 0:
@@ -235,25 +202,10 @@ def main():
 	os.makedirs(out_dir, exist_ok=True)
 	logging.info(f"Run ID: {run_id}; outputs -> {out_dir}")
 
-	# Continuous sample-level pipeline: gen -> predict -> export (no batch sync)
-	logging.info(f"Processing {N} samples continuously (workers={chosen_workers})...")
+	logging.info(f"Processing {N} samples sequentially in one process...")
 	model = Approx()
 	samples_dir = out_dir
 	os.makedirs(samples_dir, exist_ok=True)
-
-	cpu_count = mp.cpu_count() or 2
-	if args.gen_workers and args.gen_workers > 0:
-		gen_pool_size = min(N, args.gen_workers)
-	else:
-		gen_pool_size = min(N, max(1, cpu_count // 2))
-	export_worker_count = max(1, args.export_workers) if args.export_workers and args.export_workers > 0 else 2
-
-	# Bounded queues limit memory growth
-	gen_queue = queue.Queue(maxsize=chosen_workers * 2)
-	export_queue = queue.Queue(maxsize=chosen_workers * 2)
-
-	gen_pool = ProcessPoolExecutor(max_workers=gen_pool_size, mp_context=mp.get_context('spawn'))
-	logging.info(f"Pools: gen_workers={gen_pool_size}, export_workers={export_worker_count}, predict_workers={chosen_workers}, numba_threads={chosen_numba_threads or 'auto'}")
 
 	# Determine seed base once
 	if args.seed is not None:
@@ -261,59 +213,23 @@ def main():
 	else:
 		seed_base = int(np.random.SeedSequence().generate_state(1, dtype=np.uint32)[0])
 
+	logging.info(f"Numba threads: {chosen_numba_threads} (1 = effectively no numba multithreading)")
+	try:
+		import numba as _nb
+		_nb.set_num_threads(chosen_numba_threads)
+	except Exception:
+		pass
+
 	pbar = tqdm(total=N, desc='Samples')
 	t_start = time.perf_counter()
-
-	# Start predict worker threads
-	predict_threads = []
-	for _ in range(chosen_workers):
-		t = threading.Thread(
-			target=_predict_worker,
-			args=(model, gen_queue, export_queue, chosen_numba_threads),
-			daemon=True,
-		)
-		t.start()
-		predict_threads.append(t)
-
-	# Start export worker threads
-	export_threads = []
-	for _ in range(export_worker_count):
-		t = threading.Thread(
-			target=_export_worker,
-			args=(export_queue, samples_dir, pbar),
-			daemon=True,
-		)
-		t.start()
-		export_threads.append(t)
-
-	# Submit all generation tasks to the process pool
-	gen_futures = {}
 	for gidx in range(N):
 		seed_i = int(seed_base) + gidx
-		fut = gen_pool.submit(_generate_one, (seed_i, args.freq_min, args.freq_max))
-		gen_futures[fut] = gidx
-
-	# Feed generated results into predict queue as they complete
-	for fut in as_completed(gen_futures):
-		gidx = gen_futures[fut]
-		mask, normals, scene, refl, trans, dist = fut.result()
+		mask, normals, scene, refl, trans, dist = _generate_one(seed_i, args.freq_min, args.freq_max)
 		sample = build_sample_from_generated(mask, normals, scene, refl, trans, dist, building_id=gidx)
-		gen_queue.put((sample, mask, normals, refl, trans, dist, scene, gidx))
-
-	# Signal predict workers to stop (one sentinel per worker)
-	for _ in predict_threads:
-		gen_queue.put(None)
-	for t in predict_threads:
-		t.join()
-
-	# Signal export workers to stop
-	for _ in export_threads:
-		export_queue.put(None)
-	for t in export_threads:
-		t.join()
+		pred = model.approximate(sample)
+		_export_one(sample, mask, normals, refl, trans, scene, gidx, pred, samples_dir, pbar)
 
 	pbar.close()
-	gen_pool.shutdown(wait=False)
 
 	elapsed = time.perf_counter() - t_start
 	logging.info(
