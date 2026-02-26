@@ -3,20 +3,20 @@
 unified_runner.py — orchestrator + worker + status + dashboard in one script.
 
 Usage:
-  # New run (2 workers, 5 samples each):
-  python scripts/unified_runner.py start --workers 2 --samples-per-worker 5
+  # New run (2 workers, 10 total samples):
+  python scripts/unified_runner.py start --workers 2 --num-samples 10
 
   # Dry run:
-  python scripts/unified_runner.py start --workers 4 --samples-per-worker 10 --dry-run
+  python scripts/unified_runner.py start --workers 4 --num-samples 40 --dry-run
 
   # Reattach to existing run:
-  python scripts/unified_runner.py start --run-dir analysis/unified_runs/2026_...
+  python scripts/unified_runner.py start --run-dir data/2026_...
 
   # Status snapshot:
-  python scripts/unified_runner.py status --run-dir analysis/unified_runs/2026_...
+  python scripts/unified_runner.py status --run-dir data/2026_...
 
   # Dashboard (launched automatically by orchestrator, or manually):
-  python -m streamlit run scripts/unified_runner.py -- dashboard --run-dir <path>
+  python -m streamlit run scripts/unified_runner.py -- dashboard
 """
 
 import argparse, datetime, json, logging, os, signal, subprocess, sys, time, uuid
@@ -28,8 +28,13 @@ META = "meta.json"
 STATE = "runner_state.json"
 CONTROL = "control.json"
 STALE_S = 60
-POLL_S = 1
+POLL_S = 5
 ST_PORT = 8501
+DEFAULT_WORKERS = 5
+DEFAULT_NUM_SAMPLES = 25
+DEFAULT_FREQ_MIN = 400
+DEFAULT_FREQ_MAX = 10000
+DEFAULT_NUMBA_THREADS = 1
 
 # ── helpers ──────────────────────────────────────────────────
 
@@ -41,6 +46,28 @@ def _write(path, data):
     with open(tmp, "w") as f:
         json.dump(data, f, indent=2)
     os.replace(tmp, path)
+
+def _default_runs_base():
+    return os.path.join(Path(__file__).resolve().parent, "data")
+
+def _latest_run_dir(base_dir):
+    if not os.path.isdir(base_dir):
+        return None
+    cand = []
+    for e in os.scandir(base_dir):
+        if not e.is_dir():
+            continue
+        st_path = os.path.join(e.path, STATE)
+        if os.path.isfile(st_path):
+            try:
+                mt = os.path.getmtime(st_path)
+            except OSError:
+                mt = 0.0
+            cand.append((mt, e.path))
+    if not cand:
+        return None
+    cand.sort(key=lambda x: x[0], reverse=True)
+    return cand[0][1]
 
 def _read(path):
     try:
@@ -96,7 +123,7 @@ def _count_done(out_dir):
                 n += 1
     return n
 
-def _parse_utc(ts):
+def _parse_iso_utc(ts):
     if not ts:
         return None
     try:
@@ -104,58 +131,37 @@ def _parse_utc(ts):
     except Exception:
         return None
 
-def _heartbeat_age_seconds(meta):
-    dt = _parse_utc(meta.get("last_heartbeat_utc", ""))
-    if not dt:
-        return None
-    return max(0.0, (datetime.datetime.now(datetime.timezone.utc) - dt).total_seconds())
+def _fmt_elapsed_hms(seconds):
+    s = max(0, int(seconds))
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{sec:02d}"
 
-def _format_age(age_s):
-    if age_s is None:
-        return "-"
-    age = int(age_s)
-    if age < 60:
-        return f"{age}s ago"
-    mm, ss = divmod(age, 60)
-    if mm < 60:
-        return f"{mm}m {ss}s ago"
-    hh, mm = divmod(mm, 60)
-    return f"{hh}h {mm}m ago"
+def _resolve_targets(num_workers, num_samples=None, samples_per_worker=None):
+    nw = int(num_workers or 0)
+    if nw <= 0:
+        raise ValueError("workers must be > 0")
 
-def _dashboard_status(meta):
-    s = str(meta.get("status", "unknown")).lower()
-    remaining = int(meta.get("remaining_samples", 0) or 0)
-    if s == "completed":
-        return "completed" if remaining <= 0 else "incomplete"
-    if s in {"incomplete", "retired", "starting"}:
-        return s
-    if s == "running":
-        return "running" if _worker_alive(meta) else "dead"
-    if s in {"dead", "failed"}:
-        return "dead"
-    # Catch stale/missing heartbeats for unknown statuses with a PID.
-    if meta.get("pid", 0) and not _worker_alive(meta):
-        return "dead"
-    return s
+    ns = None if num_samples is None else int(num_samples)
+    spw = None if samples_per_worker is None else int(samples_per_worker)
+    if ns is None and spw is None:
+        raise ValueError("missing sample target")
 
-def _tail_lines(path, n_lines=60):
-    try:
-        with open(path, "r", errors="replace") as f:
-            lines = f.readlines()
-    except FileNotFoundError:
-        return []
-    return lines[-max(1, int(n_lines)):]
+    if ns is None:
+        if spw < 0:
+            raise ValueError("samples_per_worker must be >= 0")
+        ns = nw * spw
 
-def _extract_last_error(log_lines):
-    if not log_lines:
-        return ""
-    for i in range(len(log_lines) - 1, -1, -1):
-        low = log_lines[i].lower()
-        if ("failed:" in low) or ("error" in low) or ("traceback" in low):
-            start = max(0, i - 3)
-            end = min(len(log_lines), i + 8)
-            return "".join(log_lines[start:end]).strip()
-    return ""
+    if spw is None:
+        if ns < 0:
+            raise ValueError("num_samples must be >= 0")
+        if ns % nw != 0:
+            raise ValueError("num_samples must be divisible by workers")
+        spw = ns // nw
+
+    if ns != nw * spw:
+        raise ValueError("num_samples must equal workers * samples_per_worker")
+    return ns, spw
 
 def _control_path(run_dir, worker_id):
     return os.path.join(run_dir, "workers", worker_id, CONTROL)
@@ -434,11 +440,36 @@ def _launch_worker(run_dir, wid, target, seed_base, fmin, fmax, nt):
     return proc
 
 def _launch_streamlit(run_dir, port):
-    return subprocess.Popen([
-        sys.executable, "-m", "streamlit", "run", os.path.abspath(__file__),
-        "--server.port", str(port), "--server.headless", "true",
-        "--", "dashboard", "--run-dir", run_dir,
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    env = os.environ.copy()
+    env["UNIFIED_RUN_DIR"] = os.path.realpath(os.path.abspath(run_dir))
+    slog = os.path.join(run_dir, "streamlit.log")
+    sfh = open(slog, "a", encoding="utf-8", buffering=1)
+    try:
+        proc = subprocess.Popen([
+            sys.executable, "-m", "streamlit", "run", os.path.abspath(__file__),
+            "--server.port", str(port), "--server.headless", "true",
+            "--", "dashboard",
+        ], stdout=sfh, stderr=subprocess.STDOUT, env=env)
+    except Exception:
+        try:
+            sfh.close()
+        except Exception:
+            pass
+        raise
+    proc._streamlit_log_handle = sfh
+    return proc
+
+def _close_streamlit_log_handle(proc):
+    fh = getattr(proc, "_streamlit_log_handle", None)
+    if fh:
+        try:
+            fh.flush()
+        except Exception:
+            pass
+        try:
+            fh.close()
+        except Exception:
+            pass
 
 # ── orchestrator mode ────────────────────────────────────────
 
@@ -446,15 +477,18 @@ def cmd_start(args):
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s")
 
     nw = args.workers
-    spw = args.samples_per_worker
-    if nw > 8 and not args.force:
-        log.error(f"{nw} workers > soft limit 8. Use --force."); sys.exit(1)
+    total_samples = args.num_samples
+    try:
+        total_samples, spw = _resolve_targets(nw, num_samples=total_samples)
+    except ValueError as e:
+        raise SystemExit(f"Invalid start arguments: {e}")
+    port = ST_PORT
 
     # Resolve run dir
     if args.run_dir:
         rd = os.path.abspath(args.run_dir)
     else:
-        base = os.path.join(Path(__file__).resolve().parent.parent, "analysis", "unified_runs")
+        base = _default_runs_base()
         os.makedirs(base, exist_ok=True)
         rd = os.path.join(base, datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S"))
         i = 1
@@ -472,28 +506,49 @@ def cmd_start(args):
         log.info(f"Reattaching to {rd}")
         prev_orch_pid = existing.get("orchestrator_pid", 0)
         nw = existing.get("num_workers", nw)
-        spw = existing.get("samples_per_worker", spw)
-        seed = existing.get("global_seed", args.seed)
-        fmin = existing.get("freq_min", args.freq_min)
-        fmax = existing.get("freq_max", args.freq_max)
-        nt = existing.get("numba_threads", args.numba_threads)
+        try:
+            total_samples, spw = _resolve_targets(
+                nw,
+                num_samples=existing.get("num_samples"),
+                samples_per_worker=existing.get("samples_per_worker"),
+            )
+        except ValueError:
+            # Backward compatibility for old states that may only have total_target.
+            total_samples = int(existing.get("total_target", total_samples))
+            total_samples, spw = _resolve_targets(
+                nw,
+                num_samples=total_samples,
+                samples_per_worker=existing.get("samples_per_worker"),
+            )
+        seed = existing.get("global_seed")
+        if seed is None:
+            import numpy as np
+            seed = int(np.random.SeedSequence().generate_state(1, dtype=np.uint32)[0])
+        fmin = existing.get("freq_min", DEFAULT_FREQ_MIN)
+        fmax = existing.get("freq_max", DEFAULT_FREQ_MAX)
+        nt = existing.get("numba_threads", DEFAULT_NUMBA_THREADS)
         force_takeover = bool(prev_orch_pid and prev_orch_pid != os.getpid())
         existing["orchestrator_pid"] = os.getpid()
         existing["reattached_utc"] = _now()
         existing["previous_orchestrator_pid"] = prev_orch_pid
+        existing["num_samples"] = total_samples
+        existing["samples_per_worker"] = spw
+        existing["total_target"] = total_samples
         _write(sp, existing)
     else:
         import numpy as np
-        seed = args.seed if args.seed is not None else int(np.random.SeedSequence().generate_state(1, dtype=np.uint32)[0])
-        fmin, fmax, nt = args.freq_min, args.freq_max, args.numba_threads
+        seed = int(np.random.SeedSequence().generate_state(1, dtype=np.uint32)[0])
+        fmin, fmax, nt = DEFAULT_FREQ_MIN, DEFAULT_FREQ_MAX, DEFAULT_NUMBA_THREADS
         _write(sp, {
-            "run_dir": rd, "num_workers": nw, "samples_per_worker": spw,
-            "total_target": nw * spw, "global_seed": seed,
+            "run_dir": rd, "num_workers": nw, "num_samples": total_samples,
+            "samples_per_worker": spw, "total_target": total_samples, "global_seed": seed,
             "freq_min": fmin, "freq_max": fmax, "numba_threads": nt,
             "created_utc": _now(), "orchestrator_pid": os.getpid(),
         })
 
-    log.info(f"Run: {rd}  workers={nw}  samples/worker={spw}  seed={seed}")
+    log.info(f"Run: {rd}  workers={nw}  num_samples={total_samples}  samples/worker={spw}  seed={seed}")
+    if not args.no_ui:
+        log.info(f"Streamlit URL: http://localhost:{port}")
 
     if args.dry_run:
         log.info("=== DRY RUN ===")
@@ -538,8 +593,8 @@ def cmd_start(args):
     st_proc = None
     if not args.no_ui:
         try:
-            st_proc = _launch_streamlit(rd, args.port)
-            log.info(f"Streamlit on port {args.port} (PID {st_proc.pid})")
+            st_proc = _launch_streamlit(rd, port)
+            log.info(f"Streamlit on port {port} (PID {st_proc.pid})")
         except Exception as e:
             log.warning(f"Streamlit launch failed: {e}")
 
@@ -550,6 +605,49 @@ def cmd_start(args):
     logging.getLogger().addHandler(fh)
 
     log.info("Monitor loop started. Ctrl+C to stop (workers terminate with orchestrator).")
+    inline_progress = sys.stdout.isatty()
+    progress_line_len = 0
+    loop_started_at = time.monotonic()
+    prev_progress_t = None
+    prev_progress_done = None
+
+    def _clear_inline_progress():
+        nonlocal progress_line_len
+        if inline_progress and progress_line_len > 0:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            progress_line_len = 0
+
+    def _emit_progress(done, remaining, total_target):
+        nonlocal progress_line_len, prev_progress_t, prev_progress_done
+        now_t = time.monotonic()
+        elapsed_s = max(0, int(now_t - loop_started_at))
+        hh, rem = divmod(elapsed_s, 3600)
+        mm, ss = divmod(rem, 60)
+        elapsed = f"{hh:02d}:{mm:02d}:{ss:02d}"
+        if prev_progress_t is None:
+            combined_sps = 0.0
+        else:
+            dt = now_t - prev_progress_t
+            dd = done - prev_progress_done
+            combined_sps = (dd / dt) if dt > 0 else 0.0
+            if combined_sps < 0:
+                combined_sps = 0.0
+        prev_progress_t = now_t
+        prev_progress_done = done
+        msg = (
+            f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]}] "
+            f"Progress: {done}/{total_target} ({remaining} remaining) "
+            f"elapsed={elapsed} sps={combined_sps:.2f}"
+        )
+        if inline_progress:
+            pad = max(0, progress_line_len - len(msg))
+            sys.stdout.write("\r" + msg + (" " * pad))
+            sys.stdout.flush()
+            progress_line_len = len(msg)
+        else:
+            log.info(msg)
+
     try:
         while True:
             time.sleep(POLL_S)
@@ -569,19 +667,25 @@ def cmd_start(args):
                 all_done = False
                 if not _worker_alive(m):
                     sb = seed + i * spw
+                    _clear_inline_progress()
                     log.warning(f"{wid} dead (PID {m.get('pid')}). Restarting...")
                     _launch_worker(rd, wid, spw, sb, fmin, fmax, nt)
 
-            log.info(f"Progress: {tg}/{nw * spw} ({tr} remaining)")
+            _emit_progress(tg, tr, total_samples)
             if all_done:
+                _clear_inline_progress()
                 log.info("All workers completed!"); break
             if st_proc and st_proc.poll() is not None:
+                _clear_inline_progress()
                 log.warning("Streamlit died, restarting...")
+                _close_streamlit_log_handle(st_proc)
                 try:
-                    st_proc = _launch_streamlit(rd, args.port)
+                    log.info(f"Streamlit URL: http://localhost:{port}")
+                    st_proc = _launch_streamlit(rd, port)
                 except Exception:
                     pass
     except KeyboardInterrupt:
+        _clear_inline_progress()
         log.info("Orchestrator stopping. Terminating live workers...")
         for i in range(nw):
             wid = f"worker_{i:03d}"
@@ -593,22 +697,44 @@ def cmd_start(args):
                 _mark_pid_dead(rd, wid, pid)
                 _terminate_pid(pid, run_dir=rd, worker_id=wid)
     finally:
+        _clear_inline_progress()
         if st_proc:
-            try: st_proc.terminate()
-            except Exception: pass
+            try:
+                st_proc.terminate()
+            except Exception:
+                pass
+            try:
+                st_proc.wait(timeout=5)
+            except Exception:
+                try:
+                    st_proc.kill()
+                except Exception:
+                    pass
+            _close_streamlit_log_handle(st_proc)
 
 # ── status mode ──────────────────────────────────────────────
 
 def cmd_status(args):
-    rd = os.path.abspath(args.run_dir)
+    run_dir = args.run_dir or _latest_run_dir(_default_runs_base())
+    if not run_dir:
+        print(f"No run found in default base: {_default_runs_base()}"); sys.exit(1)
+    rd = os.path.realpath(os.path.abspath(run_dir))
     st = _read(os.path.join(rd, STATE))
     if not st:
         print(f"No run at {rd}"); sys.exit(1)
 
     nw = st.get("num_workers", 0)
-    spw = st.get("samples_per_worker", 0)
+    try:
+        total_samples, spw = _resolve_targets(
+            nw,
+            num_samples=st.get("num_samples"),
+            samples_per_worker=st.get("samples_per_worker"),
+        )
+    except ValueError:
+        total_samples = int(st.get("total_target", 0) or 0)
+        spw = int(st.get("samples_per_worker", 0) or 0)
     print(f"Run: {rd}")
-    print(f"Workers: {nw}  Samples/worker: {spw}  Total: {nw * spw}")
+    print(f"Workers: {nw}  Samples/worker: {spw}  Total: {total_samples}")
     print(f"Seed: {st.get('global_seed')}  Freq: [{st.get('freq_min')}, {st.get('freq_max')}] MHz\n")
 
     rows, tg = [], 0
@@ -633,303 +759,148 @@ def cmd_status(args):
     print(fmt.format(*("-" * w for w in ws)))
     for r in rows:
         print(fmt.format(*r))
-    print(f"\nTotal: {tg}/{nw * spw}")
+    print(f"\nTotal: {tg}/{total_samples}")
 
 # ── dashboard mode (streamlit) ───────────────────────────────
 
 def cmd_dashboard(args):
     import streamlit as st
-    try:
-        import pandas as pd
-    except Exception:
-        pd = None
 
-    rd = os.path.abspath(args.run_dir)
+    run_dir = os.environ.get("UNIFIED_RUN_DIR")
+    if not run_dir:
+        run_dir = _latest_run_dir(_default_runs_base())
+    if not run_dir:
+        st.set_page_config(page_title="Runner Dashboard", layout="wide")
+        st.title("Unified Runner Dashboard")
+        st.error(f"No run found in default base: {_default_runs_base()}")
+        return
+
+    rd = os.path.realpath(os.path.abspath(run_dir))
+    state = _read(os.path.join(rd, STATE))
 
     st.set_page_config(page_title="Runner Dashboard", layout="wide")
     st.title("Unified Runner Dashboard")
-    st.caption(f"Run directory: `{rd}`")
+    st.caption(f"Run dir: `{rd}`")
 
-    def _mtime_ns(path):
-        try:
-            return os.stat(path).st_mtime_ns
-        except OSError:
-            return 0
+    if not state:
+        st.error(f"No run at {rd}"); return
 
-    @st.cache_data(ttl=1, show_spinner=False)
-    def _read_json_cached(path, mtime_ns):
-        del mtime_ns
-        return _read(path)
+    nw = state.get("num_workers", 0)
+    try:
+        total, spw = _resolve_targets(
+            nw,
+            num_samples=state.get("num_samples"),
+            samples_per_worker=state.get("samples_per_worker"),
+        )
+    except ValueError:
+        total = int(state.get("total_target", 0) or 0)
+        spw = int(state.get("samples_per_worker", 0) or 0)
 
-    @st.cache_data(ttl=1, show_spinner=False)
-    def _read_tail_cached(path, mtime_ns, n_lines):
-        del mtime_ns
-        return "".join(_tail_lines(path, n_lines))
+    cols = st.columns(5)
+    cols[0].metric("Workers", nw)
+    cols[1].metric("Samples/Worker", spw)
 
-    def _load_rows(state):
-        nw = state.get("num_workers", 0)
-        spw = state.get("samples_per_worker", 0)
-        rows, done_total, left_total = [], 0, 0
-        for i in range(nw):
-            wid = f"worker_{i:03d}"
-            meta_path = os.path.join(rd, "workers", wid, META)
-            control_path = os.path.join(rd, "workers", wid, CONTROL)
-            m = _read_json_cached(meta_path, _mtime_ns(meta_path))
-            c = _read_json_cached(control_path, _mtime_ns(control_path)) or {}
-            if not m:
-                rows.append({
-                    "worker_id": wid, "status": "unknown", "pid": 0,
-                    "done": 0, "left": spw, "target": spw, "restarts": 0,
-                    "generation": 0, "heartbeat_utc": "-", "heartbeat_age_s": None,
-                    "heartbeat_age": "-", "instance_id": "",
-                    "attempt_log": "", "meta": {}, "control": c,
-                })
-                left_total += spw
-                continue
+    COLORS = ["#2ecc71", "#3498db", "#e67e22", "#9b59b6", "#e74c3c", "#1abc9c", "#f39c12", "#34495e"]
+    rows, tg = [], 0
+    for i in range(nw):
+        wid = f"worker_{i:03d}"
+        m = _read(os.path.join(rd, "workers", wid, META))
+        if not m:
+            rows.append({"w": wid, "s": "unknown", "pid": "-", "g": 0, "r": spw, "rc": 0, "hb": "-", "gi": 0})
+            continue
+        s = m.get("status", "?")
+        alive = _worker_alive(m) if s == "running" else False
+        if s == "running" and not alive:
+            s = "DEAD"
+        g = m.get("generated_samples", 0)
+        tg += g
+        rows.append({"w": wid, "s": s, "pid": m.get("pid", "-"), "g": g,
+                      "r": m.get("remaining_samples", 0), "rc": m.get("restart_count", 0),
+                      "hb": m.get("last_heartbeat_utc", "-")[:19], "gi": m.get("generation_index", 0)})
 
-            status = _dashboard_status(m)
-            done = int(m.get("generated_samples", 0) or 0)
-            left = int(m.get("remaining_samples", 0) or 0)
-            age_s = _heartbeat_age_seconds(m)
-            done_total += done
-            left_total += left
-            rows.append({
-                "worker_id": wid,
-                "status": status,
-                "pid": int(m.get("pid", 0) or 0),
-                "done": done,
-                "left": left,
-                "target": max(0, done + left),
-                "restarts": int(m.get("restart_count", 0) or 0),
-                "generation": int(m.get("generation_index", 0) or 0),
-                "heartbeat_utc": str(m.get("last_heartbeat_utc", "-"))[:19],
-                "heartbeat_age_s": age_s,
-                "heartbeat_age": _format_age(age_s),
-                "instance_id": str(m.get("worker_instance_id", "")),
-                "attempt_log": str(m.get("attempt_log", "")),
-                "meta": m,
-                "control": c,
-            })
-        return rows, done_total, left_total
-
-    refresh_s = st.sidebar.slider("Refresh interval (s)", min_value=1, max_value=30, value=3)
-    trend_minutes = st.sidebar.slider("Trend window (min)", min_value=5, max_value=30, value=10)
-    log_tail_lines = st.sidebar.slider("Log tail lines", min_value=20, max_value=200, value=60, step=10)
-
-    search = st.sidebar.text_input("Search worker", value="", placeholder="worker_00")
-    sort_field = st.sidebar.selectbox(
-        "Sort by",
-        options=["worker_id", "status", "done", "left", "restarts", "generation", "heartbeat_age_s"],
-        index=0,
-    )
-    sort_desc = st.sidebar.checkbox("Sort descending", value=False)
-
-    GEN_COLORS = ["#0072B2", "#E69F00", "#009E73", "#D55E00", "#CC79A7", "#56B4E9", "#F0E442", "#999999"]
-    STATUS_STYLE = {
-        "running": ("RUNNING", "#E8F1FB", "#0B3C5D"),
-        "starting": ("STARTING", "#EEF3F8", "#334E68"),
-        "completed": ("COMPLETED", "#EAF7EC", "#1B5E20"),
-        "incomplete": ("INCOMPLETE", "#FFF4E5", "#8A4B08"),
-        "dead": ("DEAD", "#FDECEA", "#8E1B10"),
-        "retired": ("RETIRED", "#F5F5F5", "#424242"),
-        "unknown": ("UNKNOWN", "#F5F7FA", "#37474F"),
-    }
-
-    def _render_dashboard_once():
-        state_path = os.path.join(rd, STATE)
-        state = _read_json_cached(state_path, _mtime_ns(state_path))
-        if not state:
-            st.error(f"No run at {rd}")
-            return
-
-        nw = state.get("num_workers", 0)
-        spw = state.get("samples_per_worker", 0)
-        total_target = nw * spw
-
-        rows, total_done, total_left = _load_rows(state)
-        all_statuses = sorted({r["status"] for r in rows}) or ["unknown"]
-        status_filter = st.sidebar.multiselect("Status filter", options=all_statuses, default=all_statuses)
-
-        filtered = []
-        needle = search.strip().lower()
-        for r in rows:
-            if needle and needle not in r["worker_id"].lower():
-                continue
-            if r["status"] not in status_filter:
-                continue
-            filtered.append(r)
-
-        def _sort_key(item):
-            val = item.get(sort_field)
-            if sort_field in {"worker_id", "status"}:
-                return str(val or "").lower()
-            if val is None:
-                return -1
-            return val
-
-        filtered.sort(key=_sort_key, reverse=sort_desc)
-
-        running_n = sum(1 for r in rows if r["status"] == "running")
-        starting_n = sum(1 for r in rows if r["status"] == "starting")
-        dead_n = sum(1 for r in rows if r["status"] == "dead")
-        completed_n = sum(1 for r in rows if r["status"] == "completed")
-        incomplete_n = sum(1 for r in rows if r["status"] == "incomplete")
-        restart_total = sum(r["restarts"] for r in rows)
-        pct = (total_done / total_target) if total_target else 0.0
-
-        now_ts = time.time()
-        timeline_key = f"timeline::{rd}"
-        timeline = st.session_state.get(timeline_key, [])
-        prev = timeline[-1] if timeline else None
-        inst_sps = 0.0
-        if prev:
-            dt = max(1e-9, now_ts - prev["ts"])
-            inst_sps = max(0.0, (total_done - prev["done"]) / dt)
-
-        point = {
-            "ts": now_ts,
-            "done": total_done,
-            "samples_per_sec": inst_sps,
-            "dead_workers": dead_n,
-            "restart_total": restart_total,
-            "incomplete_workers": incomplete_n,
-        }
-        if (not prev) or (now_ts - prev["ts"] >= 1.0) or (point["done"] != prev["done"]) or (point["dead_workers"] != prev["dead_workers"]):
-            timeline.append(point)
-        cutoff = now_ts - (trend_minutes * 60)
-        timeline = [p for p in timeline if p["ts"] >= cutoff]
-        st.session_state[timeline_key] = timeline
-
-        avg_sps = 0.0
-        if len(timeline) >= 2:
-            dt = max(1e-9, timeline[-1]["ts"] - timeline[0]["ts"])
-            avg_sps = max(0.0, (timeline[-1]["done"] - timeline[0]["done"]) / dt)
-
-        top = st.columns(6)
-        top[0].metric("Workers", nw)
-        top[1].metric("Total Target", total_target)
-        top[2].metric("Done", total_done)
-        top[3].metric("Remaining", total_left)
-        top[4].metric("Samples/s", f"{avg_sps:.2f}")
-        top[5].metric("Restarts", restart_total)
-
-        st.progress(min(pct, 1.0))
-        st.markdown(f"**Progress: {total_done}/{total_target} ({pct:.0%})**")
-
-        stat_cols = st.columns(5)
-        stat_cols[0].metric("Running", running_n)
-        stat_cols[1].metric("Starting", starting_n)
-        stat_cols[2].metric("Dead", dead_n)
-        stat_cols[3].metric("Completed", completed_n)
-        stat_cols[4].metric("Incomplete", incomplete_n)
-
-        st.subheader("Worker Table")
-        table_rows = []
-        for r in filtered:
-            table_rows.append({
-                "Worker": r["worker_id"],
-                "Status": r["status"],
-                "PID": r["pid"],
-                "Done": r["done"],
-                "Left": r["left"],
-                "Restarts": r["restarts"],
-                "Gen": r["generation"],
-                "Heartbeat": r["heartbeat_utc"],
-                "Age": r["heartbeat_age"],
-                "Instance": r["instance_id"][:12],
-            })
-
-        if pd is not None:
-            st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
-        else:
-            st.table(table_rows)
-
-        st.subheader("Trends")
-        if pd is not None and len(timeline) >= 2:
-            tdf = pd.DataFrame(timeline)
-            tdf["time"] = pd.to_datetime(tdf["ts"], unit="s", utc=True).dt.tz_convert(None)
-            tdf = tdf.set_index("time")
-            tc1, tc2 = st.columns(2)
-            tc1.caption("Completion and throughput")
-            tc1.line_chart(tdf[["done", "samples_per_sec"]], use_container_width=True)
-            tc2.caption("Health events")
-            tc2.line_chart(tdf[["dead_workers", "restart_total", "incomplete_workers"]], use_container_width=True)
-        else:
-            st.caption("Trend chart needs at least two refresh points.")
-
-        st.subheader("Worker Cards")
-        for r in filtered:
-            label, bg, fg = STATUS_STYLE.get(r["status"], STATUS_STYLE["unknown"])
-            gen_color = GEN_COLORS[r["generation"] % len(GEN_COLORS)]
-            st.markdown(
-                f'<div style="border-left:6px solid {gen_color};border:1px solid #d0d7de;'
-                f'border-radius:6px;padding:10px;margin:6px 0;background:{bg};color:{fg};">'
-                f'<b>{r["worker_id"]}</b> &nbsp; [{label}] &nbsp; PID:{r["pid"]} &nbsp; '
-                f'{r["done"]}/{r["target"]} samples &nbsp; restarts:{r["restarts"]} &nbsp; '
-                f'gen:{r["generation"]} &nbsp; hb:{r["heartbeat_age"]}</div>',
-                unsafe_allow_html=True,
-            )
-
-        st.subheader("Worker Diagnostics")
-        if not filtered:
-            st.info("No workers match current filters.")
-            return
-
-        worker_choices = [r["worker_id"] for r in filtered]
-        selected_worker = st.selectbox("Inspect worker", worker_choices, index=0)
-        selected = next(r for r in filtered if r["worker_id"] == selected_worker)
-
-        dcols = st.columns(4)
-        dcols[0].metric("Status", selected["status"])
-        dcols[1].metric("PID", selected["pid"])
-        dcols[2].metric("Heartbeat Age", selected["heartbeat_age"])
-        dcols[3].metric("Restarts", selected["restarts"])
-        st.caption(f"Instance: `{selected['instance_id']}` | Generation: `{selected['generation']}`")
-
-        control = selected.get("control", {}) or {}
-        dead_pids = [int(p) for p in control.get("dead_worker_pids", []) if str(p).isdigit()]
-        active_pid = control.get("active_pid", 0)
-        pid_history = dead_pids[:]
-        if str(active_pid).isdigit() and int(active_pid) > 0:
-            pid_history.append(int(active_pid))
-        st.markdown("**PID History (old -> new)**")
-        st.code(", ".join(str(p) for p in pid_history[-20:]) if pid_history else "(none)")
-
-        worker_dir = os.path.join(rd, "workers", selected_worker)
-        attempt_log = selected.get("attempt_log", "")
-        if not attempt_log:
-            try:
-                logs = sorted(n for n in os.listdir(worker_dir) if n.startswith("attempt_") and n.endswith(".log"))
-            except FileNotFoundError:
-                logs = []
-            if logs:
-                attempt_log = logs[-1]
-
-        if attempt_log:
-            log_path = os.path.join(worker_dir, attempt_log)
-            log_text = _read_tail_cached(log_path, _mtime_ns(log_path), log_tail_lines)
-            lines = log_text.splitlines(True)
-            last_error = _extract_last_error(lines)
-            st.markdown(f"**Log Tail: `{attempt_log}`**")
-            st.code(log_text if log_text else "(log empty)")
-            if last_error:
-                st.markdown("**Last Error Snippet**")
-                st.code(last_error)
-            else:
-                st.caption("No recent errors found in this log tail.")
-        else:
-            st.info("No attempt log available yet for this worker.")
-
-    if hasattr(st, "fragment"):
-        @st.fragment(run_every=f"{refresh_s}s")
-        def _refreshing_panel():
-            _render_dashboard_once()
-        _refreshing_panel()
+    pct = tg / total if total else 0
+    cols[2].metric("Generated", f"{tg}/{total}")
+    cols[3].metric("Progress", f"{pct:.0%}")
+    started_dt = _parse_iso_utc(state.get("created_utc")) or _parse_iso_utc(state.get("reattached_utc"))
+    if started_dt is not None:
+        elapsed_s = (datetime.datetime.now(datetime.timezone.utc) - started_dt).total_seconds()
+        cols[4].metric("Elapsed", _fmt_elapsed_hms(elapsed_s))
     else:
-        st.warning("This Streamlit build has no fragment auto-refresh; use manual refresh.")
-        if st.button("Refresh now"):
-            st.rerun()
-        _render_dashboard_once()
+        cols[4].metric("Elapsed", "-")
+    st.progress(min(pct, 1.0))
+    st.markdown(f"**Progress: {tg}/{total} ({pct:.0%})**")
+
+    # One line per worker: generated samples over dashboard refreshes.
+    hist_key = f"worker_generated_history::{rd}"
+    now_s = time.time()
+    point = {"ts": now_s}
+    for r in rows:
+        point[r["w"]] = int(r["g"])
+    hist = st.session_state.get(hist_key, [])
+    if (not hist) or (now_s - float(hist[-1].get("ts", 0)) >= 0.5):
+        hist.append(point)
+    hist = hist[-300:]
+    st.session_state[hist_key] = hist
+
+    st.markdown("**Generated Samples Per Worker**")
+    if len(hist) >= 2:
+        try:
+            import pandas as pd
+            df = pd.DataFrame(hist)
+            df["time"] = pd.to_datetime(df["ts"], unit="s").dt.strftime("%H:%M:%S")
+            df = df.drop(columns=["ts"]).set_index("time")
+            st.line_chart(df)
+        except Exception:
+            chart_rows = [{k: v for k, v in h.items() if k != "ts"} for h in hist]
+            st.line_chart(chart_rows)
+    else:
+        st.line_chart([{r["w"]: int(r["g"]) for r in rows}])
+
+    # Combined throughput (samples/sec) across all workers.
+    sps_hist = []
+    for i in range(1, len(hist)):
+        prev = hist[i - 1]
+        cur = hist[i]
+        dt = float(cur.get("ts", 0.0)) - float(prev.get("ts", 0.0))
+        if dt <= 0:
+            continue
+        prev_total = sum(float(v) for k, v in prev.items() if k != "ts")
+        cur_total = sum(float(v) for k, v in cur.items() if k != "ts")
+        sps = max(0.0, (cur_total - prev_total) / dt)
+        sps_hist.append({"ts": float(cur.get("ts", 0.0)), "combined_sps": sps})
+
+    st.markdown("**Combined Samples/sec (All Workers)**")
+    if len(sps_hist) >= 2:
+        try:
+            import pandas as pd
+            sdf = pd.DataFrame(sps_hist)
+            sdf["time"] = pd.to_datetime(sdf["ts"], unit="s").dt.strftime("%H:%M:%S")
+            sdf = sdf.drop(columns=["ts"]).set_index("time")
+            st.line_chart(sdf)
+        except Exception:
+            st.line_chart([{"combined_sps": p["combined_sps"]} for p in sps_hist])
+    else:
+        st.line_chart([{"combined_sps": 0.0}])
+
+    a = sum(1 for r in rows if r["s"] == "running")
+    d = sum(1 for r in rows if r["s"] == "DEAD")
+    c = sum(1 for r in rows if r["s"] == "completed")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Running", a); c2.metric("Dead", d); c3.metric("Completed", c)
+
+    for r in rows:
+        color = COLORS[r["gi"] % len(COLORS)]
+        icon = {"running": "🟢", "completed": "✅", "DEAD": "🔴"}.get(r["s"], "⚪")
+        bg = "#1a1a2e" if r["s"] != "DEAD" else "#2d1b1b"
+        t = r["g"] + r["r"]
+        st.markdown(
+            f'<div style="border-left:4px solid {color};padding:8px;margin:4px 0;background:{bg}">'
+            f'<b>{icon} {r["w"]}</b> &nbsp; {r["s"]} &nbsp; PID:{r["pid"]} &nbsp; '
+            f'{r["g"]}/{t} samples &nbsp; restarts:{r["rc"]} &nbsp; gen:{r["gi"]} &nbsp; '
+            f'hb:{r["hb"]}</div>', unsafe_allow_html=True)
+
+    time.sleep(3)
+    st.rerun()
 
 # ── CLI ──────────────────────────────────────────────────────
 
@@ -939,19 +910,13 @@ def main():
 
     s = sub.add_parser("start", help="Launch/reattach orchestrator")
     s.add_argument("--run-dir", default=None)
-    s.add_argument("--workers", type=int, default=2)
-    s.add_argument("--samples-per-worker", type=int, default=5)
-    s.add_argument("--seed", type=int, default=None)
-    s.add_argument("--freq-min", type=int, default=400)
-    s.add_argument("--freq-max", type=int, default=10000)
-    s.add_argument("--numba-threads", type=int, default=1)
-    s.add_argument("--force", action="store_true", help="Allow >8 workers")
+    s.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
+    s.add_argument("--num-samples", type=int, default=DEFAULT_NUM_SAMPLES)
     s.add_argument("--dry-run", action="store_true")
     s.add_argument("--no-ui", action="store_true")
-    s.add_argument("--port", type=int, default=ST_PORT)
 
     s = sub.add_parser("status", help="Print status snapshot")
-    s.add_argument("--run-dir", required=True)
+    s.add_argument("--run-dir", default=None)
 
     s = sub.add_parser("worker", help="(internal) single worker")
     s.add_argument("--run-dir", required=True)
@@ -964,7 +929,6 @@ def main():
     s.add_argument("--instance-id", required=True)
 
     s = sub.add_parser("dashboard", help="(internal) streamlit UI")
-    s.add_argument("--run-dir", required=True)
 
     args = p.parse_args()
     {"start": cmd_start, "status": cmd_status, "worker": cmd_worker, "dashboard": cmd_dashboard}[args.mode](args)

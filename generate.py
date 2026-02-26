@@ -175,7 +175,7 @@ def main():
 	parser.add_argument('--numba_threads', type=int, default=1, help='Numba threads for prange kernels (default 1 disables multi-thread speedup)')
 	parser.add_argument('--seed', type=int, default=None, help='Base seed for deterministic generation (per-sample: seed+index)')
 	parser.add_argument('--run_id', type=str, default=None, help='Unique run identifier; auto-generated if omitted')
-	parser.add_argument('--out_root', type=str, default=None, help='Root directory for streamed outputs (default: ~/synth_gen/data/synthetic)')
+	parser.add_argument('--out_root', type=str, default=None, help='Root directory for streamed outputs (default: <repo>/data)')
 	parser.add_argument('--freq_min', type=int, default=400, help='Minimum frequency in MHz for uniform sampling')
 	parser.add_argument('--freq_max', type=int, default=10_000, help='Maximum frequency in MHz for uniform sampling')
 	parser.add_argument('--verbose', action='store_true', help='Enable detailed per-step timing logs (DEBUG level)')
@@ -190,11 +190,12 @@ def main():
 	N = int(max(1, args.num))
 	chosen_numba_threads = max(1, int(args.numba_threads)) if args.numba_threads is not None else 1
 
-	# Resolve output root for streaming pipeline
+	# Resolve output root for streaming pipeline.
+	# Default is repo_root/data so each run writes to data/{run_id}.
 	if args.out_root and len(str(args.out_root)) > 0:
 		base_out_root = args.out_root if os.path.isabs(args.out_root) else os.path.join(os.path.dirname(os.path.abspath(__file__)), args.out_root)
 	else:
-		base_out_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'synthetic')
+		base_out_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
 	os.makedirs(base_out_root, exist_ok=True)
 
 	# Unique run identifier and output dir (non-overwriting)
