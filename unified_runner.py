@@ -96,6 +96,67 @@ def _count_done(out_dir):
                 n += 1
     return n
 
+def _parse_utc(ts):
+    if not ts:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+def _heartbeat_age_seconds(meta):
+    dt = _parse_utc(meta.get("last_heartbeat_utc", ""))
+    if not dt:
+        return None
+    return max(0.0, (datetime.datetime.now(datetime.timezone.utc) - dt).total_seconds())
+
+def _format_age(age_s):
+    if age_s is None:
+        return "-"
+    age = int(age_s)
+    if age < 60:
+        return f"{age}s ago"
+    mm, ss = divmod(age, 60)
+    if mm < 60:
+        return f"{mm}m {ss}s ago"
+    hh, mm = divmod(mm, 60)
+    return f"{hh}h {mm}m ago"
+
+def _dashboard_status(meta):
+    s = str(meta.get("status", "unknown")).lower()
+    remaining = int(meta.get("remaining_samples", 0) or 0)
+    if s == "completed":
+        return "completed" if remaining <= 0 else "incomplete"
+    if s in {"incomplete", "retired", "starting"}:
+        return s
+    if s == "running":
+        return "running" if _worker_alive(meta) else "dead"
+    if s in {"dead", "failed"}:
+        return "dead"
+    # Catch stale/missing heartbeats for unknown statuses with a PID.
+    if meta.get("pid", 0) and not _worker_alive(meta):
+        return "dead"
+    return s
+
+def _tail_lines(path, n_lines=60):
+    try:
+        with open(path, "r", errors="replace") as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        return []
+    return lines[-max(1, int(n_lines)):]
+
+def _extract_last_error(log_lines):
+    if not log_lines:
+        return ""
+    for i in range(len(log_lines) - 1, -1, -1):
+        low = log_lines[i].lower()
+        if ("failed:" in low) or ("error" in low) or ("traceback" in low):
+            start = max(0, i - 3)
+            end = min(len(log_lines), i + 8)
+            return "".join(log_lines[start:end]).strip()
+    return ""
+
 def _control_path(run_dir, worker_id):
     return os.path.join(run_dir, "workers", worker_id, CONTROL)
 
@@ -578,67 +639,297 @@ def cmd_status(args):
 
 def cmd_dashboard(args):
     import streamlit as st
+    try:
+        import pandas as pd
+    except Exception:
+        pd = None
 
     rd = os.path.abspath(args.run_dir)
-    state = _read(os.path.join(rd, STATE))
 
     st.set_page_config(page_title="Runner Dashboard", layout="wide")
     st.title("Unified Runner Dashboard")
+    st.caption(f"Run directory: `{rd}`")
 
-    if not state:
-        st.error(f"No run at {rd}"); return
+    def _mtime_ns(path):
+        try:
+            return os.stat(path).st_mtime_ns
+        except OSError:
+            return 0
 
-    nw = state.get("num_workers", 0)
-    spw = state.get("samples_per_worker", 0)
-    total = nw * spw
+    @st.cache_data(ttl=1, show_spinner=False)
+    def _read_json_cached(path, mtime_ns):
+        del mtime_ns
+        return _read(path)
 
-    cols = st.columns(4)
-    cols[0].metric("Workers", nw)
-    cols[1].metric("Samples/Worker", spw)
-    cols[2].metric("Total Target", total)
-    cols[3].metric("Seed", state.get("global_seed"))
+    @st.cache_data(ttl=1, show_spinner=False)
+    def _read_tail_cached(path, mtime_ns, n_lines):
+        del mtime_ns
+        return "".join(_tail_lines(path, n_lines))
 
-    COLORS = ["#2ecc71", "#3498db", "#e67e22", "#9b59b6", "#e74c3c", "#1abc9c", "#f39c12", "#34495e"]
-    rows, tg = [], 0
-    for i in range(nw):
-        wid = f"worker_{i:03d}"
-        m = _read(os.path.join(rd, "workers", wid, META))
-        if not m:
-            rows.append({"w": wid, "s": "unknown", "pid": "-", "g": 0, "r": spw, "rc": 0, "hb": "-", "gi": 0})
-            continue
-        s = m.get("status", "?")
-        alive = _worker_alive(m) if s == "running" else False
-        if s == "running" and not alive:
-            s = "DEAD"
-        g = m.get("generated_samples", 0)
-        tg += g
-        rows.append({"w": wid, "s": s, "pid": m.get("pid", "-"), "g": g,
-                      "r": m.get("remaining_samples", 0), "rc": m.get("restart_count", 0),
-                      "hb": m.get("last_heartbeat_utc", "-")[:19], "gi": m.get("generation_index", 0)})
+    def _load_rows(state):
+        nw = state.get("num_workers", 0)
+        spw = state.get("samples_per_worker", 0)
+        rows, done_total, left_total = [], 0, 0
+        for i in range(nw):
+            wid = f"worker_{i:03d}"
+            meta_path = os.path.join(rd, "workers", wid, META)
+            control_path = os.path.join(rd, "workers", wid, CONTROL)
+            m = _read_json_cached(meta_path, _mtime_ns(meta_path))
+            c = _read_json_cached(control_path, _mtime_ns(control_path)) or {}
+            if not m:
+                rows.append({
+                    "worker_id": wid, "status": "unknown", "pid": 0,
+                    "done": 0, "left": spw, "target": spw, "restarts": 0,
+                    "generation": 0, "heartbeat_utc": "-", "heartbeat_age_s": None,
+                    "heartbeat_age": "-", "instance_id": "",
+                    "attempt_log": "", "meta": {}, "control": c,
+                })
+                left_total += spw
+                continue
 
-    pct = tg / total if total else 0
-    st.progress(min(pct, 1.0))
-    st.markdown(f"**Progress: {tg}/{total} ({pct:.0%})**")
+            status = _dashboard_status(m)
+            done = int(m.get("generated_samples", 0) or 0)
+            left = int(m.get("remaining_samples", 0) or 0)
+            age_s = _heartbeat_age_seconds(m)
+            done_total += done
+            left_total += left
+            rows.append({
+                "worker_id": wid,
+                "status": status,
+                "pid": int(m.get("pid", 0) or 0),
+                "done": done,
+                "left": left,
+                "target": max(0, done + left),
+                "restarts": int(m.get("restart_count", 0) or 0),
+                "generation": int(m.get("generation_index", 0) or 0),
+                "heartbeat_utc": str(m.get("last_heartbeat_utc", "-"))[:19],
+                "heartbeat_age_s": age_s,
+                "heartbeat_age": _format_age(age_s),
+                "instance_id": str(m.get("worker_instance_id", "")),
+                "attempt_log": str(m.get("attempt_log", "")),
+                "meta": m,
+                "control": c,
+            })
+        return rows, done_total, left_total
 
-    a = sum(1 for r in rows if r["s"] == "running")
-    d = sum(1 for r in rows if r["s"] == "DEAD")
-    c = sum(1 for r in rows if r["s"] == "completed")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Running", a); c2.metric("Dead", d); c3.metric("Completed", c)
+    refresh_s = st.sidebar.slider("Refresh interval (s)", min_value=1, max_value=30, value=3)
+    trend_minutes = st.sidebar.slider("Trend window (min)", min_value=5, max_value=30, value=10)
+    log_tail_lines = st.sidebar.slider("Log tail lines", min_value=20, max_value=200, value=60, step=10)
 
-    for r in rows:
-        color = COLORS[r["gi"] % len(COLORS)]
-        icon = {"running": "🟢", "completed": "✅", "DEAD": "🔴"}.get(r["s"], "⚪")
-        bg = "#1a1a2e" if r["s"] != "DEAD" else "#2d1b1b"
-        t = r["g"] + r["r"]
-        st.markdown(
-            f'<div style="border-left:4px solid {color};padding:8px;margin:4px 0;background:{bg}">'
-            f'<b>{icon} {r["w"]}</b> &nbsp; {r["s"]} &nbsp; PID:{r["pid"]} &nbsp; '
-            f'{r["g"]}/{t} samples &nbsp; restarts:{r["rc"]} &nbsp; gen:{r["gi"]} &nbsp; '
-            f'hb:{r["hb"]}</div>', unsafe_allow_html=True)
+    search = st.sidebar.text_input("Search worker", value="", placeholder="worker_00")
+    sort_field = st.sidebar.selectbox(
+        "Sort by",
+        options=["worker_id", "status", "done", "left", "restarts", "generation", "heartbeat_age_s"],
+        index=0,
+    )
+    sort_desc = st.sidebar.checkbox("Sort descending", value=False)
 
-    time.sleep(3)
-    st.rerun()
+    GEN_COLORS = ["#0072B2", "#E69F00", "#009E73", "#D55E00", "#CC79A7", "#56B4E9", "#F0E442", "#999999"]
+    STATUS_STYLE = {
+        "running": ("RUNNING", "#E8F1FB", "#0B3C5D"),
+        "starting": ("STARTING", "#EEF3F8", "#334E68"),
+        "completed": ("COMPLETED", "#EAF7EC", "#1B5E20"),
+        "incomplete": ("INCOMPLETE", "#FFF4E5", "#8A4B08"),
+        "dead": ("DEAD", "#FDECEA", "#8E1B10"),
+        "retired": ("RETIRED", "#F5F5F5", "#424242"),
+        "unknown": ("UNKNOWN", "#F5F7FA", "#37474F"),
+    }
+
+    def _render_dashboard_once():
+        state_path = os.path.join(rd, STATE)
+        state = _read_json_cached(state_path, _mtime_ns(state_path))
+        if not state:
+            st.error(f"No run at {rd}")
+            return
+
+        nw = state.get("num_workers", 0)
+        spw = state.get("samples_per_worker", 0)
+        total_target = nw * spw
+
+        rows, total_done, total_left = _load_rows(state)
+        all_statuses = sorted({r["status"] for r in rows}) or ["unknown"]
+        status_filter = st.sidebar.multiselect("Status filter", options=all_statuses, default=all_statuses)
+
+        filtered = []
+        needle = search.strip().lower()
+        for r in rows:
+            if needle and needle not in r["worker_id"].lower():
+                continue
+            if r["status"] not in status_filter:
+                continue
+            filtered.append(r)
+
+        def _sort_key(item):
+            val = item.get(sort_field)
+            if sort_field in {"worker_id", "status"}:
+                return str(val or "").lower()
+            if val is None:
+                return -1
+            return val
+
+        filtered.sort(key=_sort_key, reverse=sort_desc)
+
+        running_n = sum(1 for r in rows if r["status"] == "running")
+        starting_n = sum(1 for r in rows if r["status"] == "starting")
+        dead_n = sum(1 for r in rows if r["status"] == "dead")
+        completed_n = sum(1 for r in rows if r["status"] == "completed")
+        incomplete_n = sum(1 for r in rows if r["status"] == "incomplete")
+        restart_total = sum(r["restarts"] for r in rows)
+        pct = (total_done / total_target) if total_target else 0.0
+
+        now_ts = time.time()
+        timeline_key = f"timeline::{rd}"
+        timeline = st.session_state.get(timeline_key, [])
+        prev = timeline[-1] if timeline else None
+        inst_sps = 0.0
+        if prev:
+            dt = max(1e-9, now_ts - prev["ts"])
+            inst_sps = max(0.0, (total_done - prev["done"]) / dt)
+
+        point = {
+            "ts": now_ts,
+            "done": total_done,
+            "samples_per_sec": inst_sps,
+            "dead_workers": dead_n,
+            "restart_total": restart_total,
+            "incomplete_workers": incomplete_n,
+        }
+        if (not prev) or (now_ts - prev["ts"] >= 1.0) or (point["done"] != prev["done"]) or (point["dead_workers"] != prev["dead_workers"]):
+            timeline.append(point)
+        cutoff = now_ts - (trend_minutes * 60)
+        timeline = [p for p in timeline if p["ts"] >= cutoff]
+        st.session_state[timeline_key] = timeline
+
+        avg_sps = 0.0
+        if len(timeline) >= 2:
+            dt = max(1e-9, timeline[-1]["ts"] - timeline[0]["ts"])
+            avg_sps = max(0.0, (timeline[-1]["done"] - timeline[0]["done"]) / dt)
+
+        top = st.columns(6)
+        top[0].metric("Workers", nw)
+        top[1].metric("Total Target", total_target)
+        top[2].metric("Done", total_done)
+        top[3].metric("Remaining", total_left)
+        top[4].metric("Samples/s", f"{avg_sps:.2f}")
+        top[5].metric("Restarts", restart_total)
+
+        st.progress(min(pct, 1.0))
+        st.markdown(f"**Progress: {total_done}/{total_target} ({pct:.0%})**")
+
+        stat_cols = st.columns(5)
+        stat_cols[0].metric("Running", running_n)
+        stat_cols[1].metric("Starting", starting_n)
+        stat_cols[2].metric("Dead", dead_n)
+        stat_cols[3].metric("Completed", completed_n)
+        stat_cols[4].metric("Incomplete", incomplete_n)
+
+        st.subheader("Worker Table")
+        table_rows = []
+        for r in filtered:
+            table_rows.append({
+                "Worker": r["worker_id"],
+                "Status": r["status"],
+                "PID": r["pid"],
+                "Done": r["done"],
+                "Left": r["left"],
+                "Restarts": r["restarts"],
+                "Gen": r["generation"],
+                "Heartbeat": r["heartbeat_utc"],
+                "Age": r["heartbeat_age"],
+                "Instance": r["instance_id"][:12],
+            })
+
+        if pd is not None:
+            st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
+        else:
+            st.table(table_rows)
+
+        st.subheader("Trends")
+        if pd is not None and len(timeline) >= 2:
+            tdf = pd.DataFrame(timeline)
+            tdf["time"] = pd.to_datetime(tdf["ts"], unit="s", utc=True).dt.tz_convert(None)
+            tdf = tdf.set_index("time")
+            tc1, tc2 = st.columns(2)
+            tc1.caption("Completion and throughput")
+            tc1.line_chart(tdf[["done", "samples_per_sec"]], use_container_width=True)
+            tc2.caption("Health events")
+            tc2.line_chart(tdf[["dead_workers", "restart_total", "incomplete_workers"]], use_container_width=True)
+        else:
+            st.caption("Trend chart needs at least two refresh points.")
+
+        st.subheader("Worker Cards")
+        for r in filtered:
+            label, bg, fg = STATUS_STYLE.get(r["status"], STATUS_STYLE["unknown"])
+            gen_color = GEN_COLORS[r["generation"] % len(GEN_COLORS)]
+            st.markdown(
+                f'<div style="border-left:6px solid {gen_color};border:1px solid #d0d7de;'
+                f'border-radius:6px;padding:10px;margin:6px 0;background:{bg};color:{fg};">'
+                f'<b>{r["worker_id"]}</b> &nbsp; [{label}] &nbsp; PID:{r["pid"]} &nbsp; '
+                f'{r["done"]}/{r["target"]} samples &nbsp; restarts:{r["restarts"]} &nbsp; '
+                f'gen:{r["generation"]} &nbsp; hb:{r["heartbeat_age"]}</div>',
+                unsafe_allow_html=True,
+            )
+
+        st.subheader("Worker Diagnostics")
+        if not filtered:
+            st.info("No workers match current filters.")
+            return
+
+        worker_choices = [r["worker_id"] for r in filtered]
+        selected_worker = st.selectbox("Inspect worker", worker_choices, index=0)
+        selected = next(r for r in filtered if r["worker_id"] == selected_worker)
+
+        dcols = st.columns(4)
+        dcols[0].metric("Status", selected["status"])
+        dcols[1].metric("PID", selected["pid"])
+        dcols[2].metric("Heartbeat Age", selected["heartbeat_age"])
+        dcols[3].metric("Restarts", selected["restarts"])
+        st.caption(f"Instance: `{selected['instance_id']}` | Generation: `{selected['generation']}`")
+
+        control = selected.get("control", {}) or {}
+        dead_pids = [int(p) for p in control.get("dead_worker_pids", []) if str(p).isdigit()]
+        active_pid = control.get("active_pid", 0)
+        pid_history = dead_pids[:]
+        if str(active_pid).isdigit() and int(active_pid) > 0:
+            pid_history.append(int(active_pid))
+        st.markdown("**PID History (old -> new)**")
+        st.code(", ".join(str(p) for p in pid_history[-20:]) if pid_history else "(none)")
+
+        worker_dir = os.path.join(rd, "workers", selected_worker)
+        attempt_log = selected.get("attempt_log", "")
+        if not attempt_log:
+            try:
+                logs = sorted(n for n in os.listdir(worker_dir) if n.startswith("attempt_") and n.endswith(".log"))
+            except FileNotFoundError:
+                logs = []
+            if logs:
+                attempt_log = logs[-1]
+
+        if attempt_log:
+            log_path = os.path.join(worker_dir, attempt_log)
+            log_text = _read_tail_cached(log_path, _mtime_ns(log_path), log_tail_lines)
+            lines = log_text.splitlines(True)
+            last_error = _extract_last_error(lines)
+            st.markdown(f"**Log Tail: `{attempt_log}`**")
+            st.code(log_text if log_text else "(log empty)")
+            if last_error:
+                st.markdown("**Last Error Snippet**")
+                st.code(last_error)
+            else:
+                st.caption("No recent errors found in this log tail.")
+        else:
+            st.info("No attempt log available yet for this worker.")
+
+    if hasattr(st, "fragment"):
+        @st.fragment(run_every=f"{refresh_s}s")
+        def _refreshing_panel():
+            _render_dashboard_once()
+        _refreshing_panel()
+    else:
+        st.warning("This Streamlit build has no fragment auto-refresh; use manual refresh.")
+        if st.button("Refresh now"):
+            st.rerun()
+        _render_dashboard_once()
 
 # ── CLI ──────────────────────────────────────────────────────
 
