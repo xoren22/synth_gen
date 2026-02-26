@@ -19,13 +19,14 @@ Usage:
   python -m streamlit run scripts/unified_runner.py -- dashboard --run-dir <path>
 """
 
-import argparse, datetime, json, logging, os, subprocess, sys, time
+import argparse, datetime, json, logging, os, signal, subprocess, sys, time, uuid
 from pathlib import Path
 
 log = logging.getLogger("runner")
 
 META = "meta.json"
 STATE = "runner_state.json"
+CONTROL = "control.json"
 STALE_S = 60
 POLL_S = 1
 ST_PORT = 8501
@@ -50,11 +51,29 @@ def _read(path):
 
 def _pid_alive(pid):
     try:
-        os.kill(pid, 0); return True
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
     except (ProcessLookupError, ValueError):
         return False
     except PermissionError:
-        return True
+        pass
+
+    # `kill(pid, 0)` is true for zombies. Treat zombies as dead on Linux.
+    status_path = f"/proc/{pid}/status"
+    if os.path.exists(status_path):
+        try:
+            with open(status_path) as f:
+                for line in f:
+                    if line.startswith("State:"):
+                        return " Z" not in line
+        except Exception:
+            pass
+    return True
 
 def _worker_alive(meta):
     if not _pid_alive(meta.get("pid", 0)):
@@ -76,6 +95,115 @@ def _count_done(out_dir):
                os.path.exists(os.path.join(e.path, e.name + ".json")):
                 n += 1
     return n
+
+def _control_path(run_dir, worker_id):
+    return os.path.join(run_dir, "workers", worker_id, CONTROL)
+
+def _read_control(run_dir, worker_id):
+    c = _read(_control_path(run_dir, worker_id))
+    if c is None:
+        return {"worker_id": worker_id, "active_instance_id": "", "active_pid": 0, "dead_worker_pids": []}
+    c.setdefault("worker_id", worker_id)
+    c.setdefault("active_instance_id", "")
+    c.setdefault("active_pid", 0)
+    c.setdefault("dead_worker_pids", [])
+    return c
+
+def _write_control(run_dir, worker_id, data):
+    data["updated_utc"] = _now()
+    _write(_control_path(run_dir, worker_id), data)
+
+def _worker_should_stop(run_dir, worker_id, instance_id, pid):
+    c = _read_control(run_dir, worker_id)
+    if c.get("active_instance_id") != instance_id:
+        return True, "lease-revoked"
+    dead = c.get("dead_worker_pids", [])
+    if int(pid) in dead:
+        return True, "pid-marked-dead"
+    return False, ""
+
+def _mark_pid_dead(run_dir, worker_id, pid):
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return
+    if pid <= 0:
+        return
+    c = _read_control(run_dir, worker_id)
+    dead = c.get("dead_worker_pids", [])
+    if pid not in dead:
+        dead.append(pid)
+    c["dead_worker_pids"] = dead[-256:]  # bound file growth
+    _write_control(run_dir, worker_id, c)
+
+def _pid_matches_worker(pid, run_dir, worker_id):
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    cmdline_path = f"/proc/{pid}/cmdline"
+    if not os.path.exists(cmdline_path):
+        return False
+    try:
+        with open(cmdline_path, "rb") as f:
+            parts = [p.decode("utf-8", errors="ignore") for p in f.read().split(b"\x00") if p]
+    except Exception:
+        return False
+    if not parts:
+        return False
+    # Strictly require this process to be our worker invocation.
+    return ("unified_runner.py" in " ".join(parts) and
+            "worker" in parts and
+            "--run-dir" in parts and run_dir in parts and
+            "--worker-id" in parts and worker_id in parts)
+
+def _terminate_pid(pid, run_dir=None, worker_id=None):
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return
+    if pid <= 0 or not _pid_alive(pid):
+        return
+    if run_dir is not None and worker_id is not None and not _pid_matches_worker(pid, run_dir, worker_id):
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except Exception:
+        return
+    for _ in range(10):
+        if not _pid_alive(pid):
+            return
+        time.sleep(0.1)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except Exception:
+        pass
+
+def _set_parent_death_signal():
+    # Linux-only best effort: terminate worker when parent (orchestrator) dies.
+    try:
+        import ctypes
+        PR_SET_PDEATHSIG = 1
+        libc = ctypes.CDLL("libc.so.6")
+        libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
+        # Race guard: parent may have died before prctl call.
+        if os.getppid() == 1:
+            os.kill(os.getpid(), signal.SIGTERM)
+    except Exception:
+        pass
+
+def _reap_children():
+    while True:
+        try:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        except Exception:
+            return
+        if pid == 0:
+            return
 
 # ── worker mode ──────────────────────────────────────────────
 
@@ -111,24 +239,43 @@ def cmd_worker(args):
     done = _count_done(out)
     target = args.target_samples
     remaining = max(0, target - done)
+    my_pid = os.getpid()
 
     def update(status="running", completed=None):
         c = completed if completed is not None else _count_done(out)
         _write(mp, {
             "worker_id": args.worker_id, "target_samples": target,
             "generated_samples": c, "remaining_samples": max(0, target - c),
-            "status": status, "pid": os.getpid(),
+            "status": status, "pid": my_pid,
             "start_time_utc": start_t, "last_heartbeat_utc": _now(),
             "last_exit_code": None, "restart_count": restarts,
             "generation_index": gen_idx, "seed_base": args.seed_base,
             "attempt_log": f"attempt_{attempt:03d}.log",
-            "color_key": f"gen_{gen_idx}",
+            "color_key": f"gen_{gen_idx}", "worker_instance_id": args.instance_id,
         })
 
+    def clear_lease_pid():
+        c = _read_control(args.run_dir, args.worker_id)
+        if c.get("active_instance_id") == args.instance_id and c.get("active_pid") == my_pid:
+            c["active_pid"] = 0
+            _write_control(args.run_dir, args.worker_id, c)
+
     start_t = _now()
+    c = _read_control(args.run_dir, args.worker_id)
+    c["active_pid"] = my_pid
+    _write_control(args.run_dir, args.worker_id, c)
+
+    should_stop, reason = _worker_should_stop(args.run_dir, args.worker_id, args.instance_id, my_pid)
+    if should_stop:
+        wlog.info(f"Stop requested before start ({reason}). Exiting.")
+        update("retired", done)
+        clear_lease_pid()
+        return
+
     if remaining <= 0:
         wlog.info(f"Already done {done}/{target}. Exiting.")
         update("completed", done)
+        clear_lease_pid()
         return
 
     wlog.info(f"target={target} done={done} remaining={remaining} seed_base={args.seed_base}")
@@ -143,6 +290,13 @@ def cmd_worker(args):
     model = Approx()
     completed = done
     for i in range(remaining):
+        should_stop, reason = _worker_should_stop(args.run_dir, args.worker_id, args.instance_id, my_pid)
+        if should_stop:
+            wlog.info(f"Stop requested ({reason}). Exiting at {completed}/{target}.")
+            update("retired", completed)
+            clear_lease_pid()
+            return
+
         idx = done + i
         seed = args.seed_base + idx
         try:
@@ -156,8 +310,13 @@ def cmd_worker(args):
             wlog.error(f"Sample idx={idx} failed: {e}", exc_info=True)
         update("running", completed)
 
-    update("completed", completed)
-    wlog.info(f"Done: {completed}/{target} samples.")
+    if completed >= target:
+        update("completed", completed)
+        wlog.info(f"Done: {completed}/{target} samples.")
+    else:
+        update("incomplete", completed)
+        wlog.warning(f"Incomplete: {completed}/{target} samples.")
+    clear_lease_pid()
 
 # ── orchestrator helpers ─────────────────────────────────────
 
@@ -172,6 +331,16 @@ def _launch_worker(run_dir, wid, target, seed_base, fmin, fmax, nt):
     if old is None:  # first ever launch
         rc, gi = 0, 0
     done = _count_done(os.path.join(wdir, "out"))
+    old_pid = (old or {}).get("pid", 0)
+    if old_pid:
+        _mark_pid_dead(run_dir, wid, old_pid)
+        _terminate_pid(old_pid, run_dir=run_dir, worker_id=wid)
+
+    instance_id = uuid.uuid4().hex
+    c = _read_control(run_dir, wid)
+    c["active_instance_id"] = instance_id
+    c["active_pid"] = 0
+    _write_control(run_dir, wid, c)
 
     _write(os.path.join(wdir, META), {
         "worker_id": wid, "target_samples": target,
@@ -181,6 +350,7 @@ def _launch_worker(run_dir, wid, target, seed_base, fmin, fmax, nt):
         "last_exit_code": None, "restart_count": rc,
         "generation_index": gi, "seed_base": seed_base,
         "attempt_log": "", "color_key": f"gen_{gi}",
+        "worker_instance_id": instance_id,
     })
 
     cmd = [
@@ -188,15 +358,18 @@ def _launch_worker(run_dir, wid, target, seed_base, fmin, fmax, nt):
         "--run-dir", run_dir, "--worker-id", wid,
         "--target-samples", str(target), "--seed-base", str(seed_base),
         "--freq-min", str(fmin), "--freq-max", str(fmax),
-        "--numba-threads", str(nt),
+        "--numba-threads", str(nt), "--instance-id", instance_id,
     ]
-    proc = subprocess.Popen(cmd, start_new_session=True,
+    proc = subprocess.Popen(cmd, preexec_fn=_set_parent_death_signal,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     # Update meta with real PID
     m = _read(os.path.join(wdir, META))
     if m:
         m["pid"] = proc.pid
         _write(os.path.join(wdir, META), m)
+    c = _read_control(run_dir, wid)
+    c["active_pid"] = proc.pid
+    _write_control(run_dir, wid, c)
     return proc
 
 def _launch_streamlit(run_dir, port):
@@ -233,16 +406,20 @@ def cmd_start(args):
 
     # Reattach or new
     existing = _read(sp)
+    force_takeover = False
     if existing:
         log.info(f"Reattaching to {rd}")
+        prev_orch_pid = existing.get("orchestrator_pid", 0)
         nw = existing.get("num_workers", nw)
         spw = existing.get("samples_per_worker", spw)
         seed = existing.get("global_seed", args.seed)
         fmin = existing.get("freq_min", args.freq_min)
         fmax = existing.get("freq_max", args.freq_max)
         nt = existing.get("numba_threads", args.numba_threads)
+        force_takeover = bool(prev_orch_pid and prev_orch_pid != os.getpid())
         existing["orchestrator_pid"] = os.getpid()
         existing["reattached_utc"] = _now()
+        existing["previous_orchestrator_pid"] = prev_orch_pid
         _write(sp, existing)
     else:
         import numpy as np
@@ -271,8 +448,19 @@ def cmd_start(args):
         m = _read(mp)
         if m is None:
             to_launch.append(i)
-        elif m.get("status") == "completed":
             continue
+
+        done = (m.get("status") == "completed") and (m.get("remaining_samples", 1) <= 0)
+        if done:
+            continue
+
+        if force_takeover:
+            old_pid = m.get("pid", 0)
+            if _pid_alive(old_pid):
+                log.warning(f"  takeover: retiring stale {wid} PID {old_pid}")
+                _mark_pid_dead(rd, wid, old_pid)
+                _terminate_pid(old_pid, run_dir=rd, worker_id=wid)
+            to_launch.append(i)
         elif _worker_alive(m):
             log.info(f"  {wid} alive (PID {m['pid']})")
         else:
@@ -300,10 +488,11 @@ def cmd_start(args):
     fh.setFormatter(logging.Formatter("[%(asctime)s] %(message)s"))
     logging.getLogger().addHandler(fh)
 
-    log.info("Monitor loop started. Ctrl+C to stop (workers keep running).")
+    log.info("Monitor loop started. Ctrl+C to stop (workers terminate with orchestrator).")
     try:
         while True:
             time.sleep(POLL_S)
+            _reap_children()
             all_done, tg, tr = True, 0, 0
             for i in range(nw):
                 wid = f"worker_{i:03d}"
@@ -313,7 +502,8 @@ def cmd_start(args):
                     all_done = False; continue
                 tg += m.get("generated_samples", 0)
                 tr += m.get("remaining_samples", 0)
-                if m.get("status") == "completed":
+                done = (m.get("status") == "completed") and (m.get("remaining_samples", 1) <= 0)
+                if done:
                     continue
                 all_done = False
                 if not _worker_alive(m):
@@ -331,7 +521,16 @@ def cmd_start(args):
                 except Exception:
                     pass
     except KeyboardInterrupt:
-        log.info("Orchestrator stopped. Workers continue independently.")
+        log.info("Orchestrator stopping. Terminating live workers...")
+        for i in range(nw):
+            wid = f"worker_{i:03d}"
+            m = _read(os.path.join(rd, "workers", wid, META))
+            if not m:
+                continue
+            pid = m.get("pid", 0)
+            if _pid_alive(pid):
+                _mark_pid_dead(rd, wid, pid)
+                _terminate_pid(pid, run_dir=rd, worker_id=wid)
     finally:
         if st_proc:
             try: st_proc.terminate()
@@ -471,6 +670,7 @@ def main():
     s.add_argument("--freq-min", type=int, default=400)
     s.add_argument("--freq-max", type=int, default=10000)
     s.add_argument("--numba-threads", type=int, default=1)
+    s.add_argument("--instance-id", required=True)
 
     s = sub.add_parser("dashboard", help="(internal) streamlit UI")
     s.add_argument("--run-dir", required=True)
