@@ -220,7 +220,8 @@ def _generate_latent_fourier_pattern(
         raw = np.cos(np.outer(rel, k)) @ a + np.sin(np.outer(rel, k)) @ b
 
     losses = _map_raw_to_losses(raw, cfg, rng)
-    return losses, style
+    gains = -losses
+    return gains, style
 
 
 def _generate_gaussian_lobe_pattern(rng: np.random.Generator, cfg: RadiationPatternConfig, azimuth_deg: float, symmetry: str) -> tuple[np.ndarray, str]:
@@ -263,7 +264,8 @@ def _generate_gaussian_lobe_pattern(rng: np.random.Generator, cfg: RadiationPatt
     sigma_min = float(max(0.0, cfg.smooth_sigma_deg_min))
     sigma_max = float(max(sigma_min, cfg.smooth_sigma_deg_max))
     losses = _smooth_circular(losses, float(rng.uniform(sigma_min, sigma_max)))
-    return np.clip(losses, min_loss, max_loss), "gaussian_lobes"
+    gains = -np.clip(losses, min_loss, max_loss)
+    return gains, "gaussian_lobes"
 
 
 def generate_radiation_pattern(rng: np.random.Generator, cfg: RadiationPatternConfig) -> RadiationPatternSample:

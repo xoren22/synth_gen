@@ -132,7 +132,7 @@ def build_sample_from_generated(
 		"model": str(pattern_sample.model),
 		"style": str(pattern_sample.style),
 		"complexity_dim": int(pattern_sample.complexity_dim),
-		"units": "db_loss",
+		"units": "db_gain_negative_pathloss",
 	}
 
 	return RadarSample(
@@ -183,7 +183,7 @@ def _export_one(sample, mask, normals, refl, trans, scene, gidx, pred_t, samples
 			'x_px': int(sample.x_ant),
 			'y_px': int(sample.y_ant),
 			'azimuth_deg': float(sample.azimuth),
-			'pattern_units': 'db_loss',
+			'pattern_units': 'db_gain_negative_pathloss',
 			'is_isotropic': bool(ant_pattern.get('is_isotropic', False)),
 			'pattern_symmetry': str(ant_pattern.get('symmetry', 'none')),
 			'pattern_model': str(ant_pattern.get('model', 'latent_fourier')),
