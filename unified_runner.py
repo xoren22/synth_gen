@@ -35,6 +35,30 @@ DEFAULT_NUM_SAMPLES = 25
 DEFAULT_FREQ_MIN = 400
 DEFAULT_FREQ_MAX = 10000
 DEFAULT_NUMBA_THREADS = 1
+DEFAULT_ANT_ISO_PROB = 1.0
+DEFAULT_ANT_PATTERN_MODEL = "latent_fourier"
+DEFAULT_ANT_LATENT_DIM = 10
+DEFAULT_ANT_LATENT_DIM_MIN = 10
+DEFAULT_ANT_LATENT_DIM_MAX = 10
+DEFAULT_ANT_FOURIER_ORDER = 14
+DEFAULT_ANT_STYLE_FRONT_BACK_PROB = 0.25
+DEFAULT_ANT_STYLE_BIDIRECTIONAL_PROB = 0.25
+DEFAULT_ANT_STYLE_PETAL_PROB = 0.30
+DEFAULT_ANT_STYLE_RIPPLE_PROB = 0.20
+DEFAULT_ANT_PETAL_ORDER_MIN = 3
+DEFAULT_ANT_PETAL_ORDER_MAX = 8
+DEFAULT_ANT_DYNAMIC_RANGE_MIN_FRACTION = 0.35
+DEFAULT_ANT_DB_MIN = 0.0
+DEFAULT_ANT_DB_MAX = 20.0
+DEFAULT_ANT_LOBES_MIN = 2
+DEFAULT_ANT_LOBES_MAX = 6
+DEFAULT_ANT_LOBE_WIDTH_DEG_MIN = 18.0
+DEFAULT_ANT_LOBE_WIDTH_DEG_MAX = 80.0
+DEFAULT_ANT_SMOOTH_SIGMA_DEG_MIN = 2.0
+DEFAULT_ANT_SMOOTH_SIGMA_DEG_MAX = 8.0
+DEFAULT_ANT_SYMMETRY_PROB = 0.35
+DEFAULT_ANT_SYMMETRY_MODE = "random"
+DEFAULT_ANT_AZIMUTH_QUANTIZATION_DEG = 0.0
 
 # ── helpers ──────────────────────────────────────────────────
 
@@ -283,6 +307,7 @@ def cmd_worker(args):
         sys.path.insert(0, str(root))
 
     from generate import _generate_one, build_sample_from_generated, _export_one
+    from antenna_pattern import RadiationPatternConfig
     from approx import Approx
 
     wdir = os.path.join(args.run_dir, "workers", args.worker_id)
@@ -355,6 +380,32 @@ def cmd_worker(args):
         pass
 
     model = Approx()
+    pattern_cfg = RadiationPatternConfig(
+        pattern_model=str(args.ant_pattern_model),
+        latent_dim=int(args.ant_latent_dim),
+        latent_dim_min=int(args.ant_latent_dim_min),
+        latent_dim_max=int(args.ant_latent_dim_max),
+        fourier_order=int(args.ant_fourier_order),
+        dynamic_range_min_fraction=float(args.ant_dynamic_range_min_fraction),
+        style_front_back_prob=float(args.ant_style_front_back_prob),
+        style_bidirectional_prob=float(args.ant_style_bidirectional_prob),
+        style_petal_prob=float(args.ant_style_petal_prob),
+        style_ripple_prob=float(args.ant_style_ripple_prob),
+        petal_order_min=int(args.ant_petal_order_min),
+        petal_order_max=int(args.ant_petal_order_max),
+        isotropic_probability=float(args.ant_iso_prob),
+        min_loss_db=float(args.ant_db_min),
+        max_loss_db=float(args.ant_db_max),
+        lobe_count_min=int(args.ant_lobes_min),
+        lobe_count_max=int(args.ant_lobes_max),
+        lobe_width_deg_min=float(args.ant_lobe_width_deg_min),
+        lobe_width_deg_max=float(args.ant_lobe_width_deg_max),
+        smooth_sigma_deg_min=float(args.ant_smooth_sigma_deg_min),
+        smooth_sigma_deg_max=float(args.ant_smooth_sigma_deg_max),
+        symmetry_probability=float(args.ant_symmetry_prob),
+        symmetry_mode=str(args.ant_symmetry_mode),
+        azimuth_quantization_deg=float(args.ant_azimuth_quantization_deg),
+    )
     completed = done
     for i in range(remaining):
         should_stop, reason = _worker_should_stop(args.run_dir, args.worker_id, args.instance_id, my_pid)
@@ -368,7 +419,17 @@ def cmd_worker(args):
         seed = args.seed_base + idx
         try:
             mask, normals, scene, refl, trans, dist = _generate_one(seed, args.freq_min, args.freq_max)
-            sample = build_sample_from_generated(mask, normals, scene, refl, trans, dist, building_id=idx)
+            sample = build_sample_from_generated(
+                mask,
+                normals,
+                scene,
+                refl,
+                trans,
+                dist,
+                building_id=idx,
+                pattern_cfg=pattern_cfg,
+                pattern_seed=seed + 777_777,
+            )
             pred = model.approximate(sample)
             _export_one(sample, mask, normals, refl, trans, scene, idx, pred, out)
             completed += 1
@@ -387,7 +448,7 @@ def cmd_worker(args):
 
 # ── orchestrator helpers ─────────────────────────────────────
 
-def _launch_worker(run_dir, wid, target, seed_base, fmin, fmax, nt):
+def _launch_worker(run_dir, wid, target, seed_base, fmin, fmax, nt, ant_cfg):
     wdir = os.path.join(run_dir, "workers", wid)
     os.makedirs(wdir, exist_ok=True)
 
@@ -426,6 +487,30 @@ def _launch_worker(run_dir, wid, target, seed_base, fmin, fmax, nt):
         "--target-samples", str(target), "--seed-base", str(seed_base),
         "--freq-min", str(fmin), "--freq-max", str(fmax),
         "--numba-threads", str(nt), "--instance-id", instance_id,
+        "--ant-iso-prob", str(ant_cfg["ant_iso_prob"]),
+        "--ant-pattern-model", str(ant_cfg["ant_pattern_model"]),
+        "--ant-latent-dim", str(ant_cfg["ant_latent_dim"]),
+        "--ant-latent-dim-min", str(ant_cfg["ant_latent_dim_min"]),
+        "--ant-latent-dim-max", str(ant_cfg["ant_latent_dim_max"]),
+        "--ant-fourier-order", str(ant_cfg["ant_fourier_order"]),
+        "--ant-style-front-back-prob", str(ant_cfg["ant_style_front_back_prob"]),
+        "--ant-style-bidirectional-prob", str(ant_cfg["ant_style_bidirectional_prob"]),
+        "--ant-style-petal-prob", str(ant_cfg["ant_style_petal_prob"]),
+        "--ant-style-ripple-prob", str(ant_cfg["ant_style_ripple_prob"]),
+        "--ant-petal-order-min", str(ant_cfg["ant_petal_order_min"]),
+        "--ant-petal-order-max", str(ant_cfg["ant_petal_order_max"]),
+        "--ant-dynamic-range-min-fraction", str(ant_cfg["ant_dynamic_range_min_fraction"]),
+        "--ant-db-min", str(ant_cfg["ant_db_min"]),
+        "--ant-db-max", str(ant_cfg["ant_db_max"]),
+        "--ant-lobes-min", str(ant_cfg["ant_lobes_min"]),
+        "--ant-lobes-max", str(ant_cfg["ant_lobes_max"]),
+        "--ant-lobe-width-deg-min", str(ant_cfg["ant_lobe_width_deg_min"]),
+        "--ant-lobe-width-deg-max", str(ant_cfg["ant_lobe_width_deg_max"]),
+        "--ant-smooth-sigma-deg-min", str(ant_cfg["ant_smooth_sigma_deg_min"]),
+        "--ant-smooth-sigma-deg-max", str(ant_cfg["ant_smooth_sigma_deg_max"]),
+        "--ant-symmetry-prob", str(ant_cfg["ant_symmetry_prob"]),
+        "--ant-symmetry-mode", str(ant_cfg["ant_symmetry_mode"]),
+        "--ant-azimuth-quantization-deg", str(ant_cfg["ant_azimuth_quantization_deg"]),
     ]
     proc = subprocess.Popen(cmd, preexec_fn=_set_parent_death_signal,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -527,6 +612,32 @@ def cmd_start(args):
         fmin = existing.get("freq_min", DEFAULT_FREQ_MIN)
         fmax = existing.get("freq_max", DEFAULT_FREQ_MAX)
         nt = existing.get("numba_threads", DEFAULT_NUMBA_THREADS)
+        ant_cfg = {
+            "ant_iso_prob": existing.get("ant_iso_prob", DEFAULT_ANT_ISO_PROB),
+            "ant_pattern_model": existing.get("ant_pattern_model", DEFAULT_ANT_PATTERN_MODEL),
+            "ant_latent_dim": existing.get("ant_latent_dim", DEFAULT_ANT_LATENT_DIM),
+            "ant_latent_dim_min": existing.get("ant_latent_dim_min", DEFAULT_ANT_LATENT_DIM_MIN),
+            "ant_latent_dim_max": existing.get("ant_latent_dim_max", DEFAULT_ANT_LATENT_DIM_MAX),
+            "ant_fourier_order": existing.get("ant_fourier_order", DEFAULT_ANT_FOURIER_ORDER),
+            "ant_style_front_back_prob": existing.get("ant_style_front_back_prob", DEFAULT_ANT_STYLE_FRONT_BACK_PROB),
+            "ant_style_bidirectional_prob": existing.get("ant_style_bidirectional_prob", DEFAULT_ANT_STYLE_BIDIRECTIONAL_PROB),
+            "ant_style_petal_prob": existing.get("ant_style_petal_prob", DEFAULT_ANT_STYLE_PETAL_PROB),
+            "ant_style_ripple_prob": existing.get("ant_style_ripple_prob", DEFAULT_ANT_STYLE_RIPPLE_PROB),
+            "ant_petal_order_min": existing.get("ant_petal_order_min", DEFAULT_ANT_PETAL_ORDER_MIN),
+            "ant_petal_order_max": existing.get("ant_petal_order_max", DEFAULT_ANT_PETAL_ORDER_MAX),
+            "ant_dynamic_range_min_fraction": existing.get("ant_dynamic_range_min_fraction", DEFAULT_ANT_DYNAMIC_RANGE_MIN_FRACTION),
+            "ant_db_min": existing.get("ant_db_min", DEFAULT_ANT_DB_MIN),
+            "ant_db_max": existing.get("ant_db_max", DEFAULT_ANT_DB_MAX),
+            "ant_lobes_min": existing.get("ant_lobes_min", DEFAULT_ANT_LOBES_MIN),
+            "ant_lobes_max": existing.get("ant_lobes_max", DEFAULT_ANT_LOBES_MAX),
+            "ant_lobe_width_deg_min": existing.get("ant_lobe_width_deg_min", DEFAULT_ANT_LOBE_WIDTH_DEG_MIN),
+            "ant_lobe_width_deg_max": existing.get("ant_lobe_width_deg_max", DEFAULT_ANT_LOBE_WIDTH_DEG_MAX),
+            "ant_smooth_sigma_deg_min": existing.get("ant_smooth_sigma_deg_min", DEFAULT_ANT_SMOOTH_SIGMA_DEG_MIN),
+            "ant_smooth_sigma_deg_max": existing.get("ant_smooth_sigma_deg_max", DEFAULT_ANT_SMOOTH_SIGMA_DEG_MAX),
+            "ant_symmetry_prob": existing.get("ant_symmetry_prob", DEFAULT_ANT_SYMMETRY_PROB),
+            "ant_symmetry_mode": existing.get("ant_symmetry_mode", DEFAULT_ANT_SYMMETRY_MODE),
+            "ant_azimuth_quantization_deg": existing.get("ant_azimuth_quantization_deg", DEFAULT_ANT_AZIMUTH_QUANTIZATION_DEG),
+        }
         force_takeover = bool(prev_orch_pid and prev_orch_pid != os.getpid())
         existing["orchestrator_pid"] = os.getpid()
         existing["reattached_utc"] = _now()
@@ -534,19 +645,98 @@ def cmd_start(args):
         existing["num_samples"] = total_samples
         existing["samples_per_worker"] = spw
         existing["total_target"] = total_samples
+        for k, v in ant_cfg.items():
+            existing[k] = v
         _write(sp, existing)
     else:
         import numpy as np
         seed = int(np.random.SeedSequence().generate_state(1, dtype=np.uint32)[0])
         fmin, fmax, nt = DEFAULT_FREQ_MIN, DEFAULT_FREQ_MAX, DEFAULT_NUMBA_THREADS
+        ant_cfg = {
+            "ant_iso_prob": float(args.ant_iso_prob),
+            "ant_pattern_model": str(args.ant_pattern_model),
+            "ant_latent_dim": int(args.ant_latent_dim),
+            "ant_latent_dim_min": int(args.ant_latent_dim_min),
+            "ant_latent_dim_max": int(args.ant_latent_dim_max),
+            "ant_fourier_order": int(args.ant_fourier_order),
+            "ant_style_front_back_prob": float(args.ant_style_front_back_prob),
+            "ant_style_bidirectional_prob": float(args.ant_style_bidirectional_prob),
+            "ant_style_petal_prob": float(args.ant_style_petal_prob),
+            "ant_style_ripple_prob": float(args.ant_style_ripple_prob),
+            "ant_petal_order_min": int(args.ant_petal_order_min),
+            "ant_petal_order_max": int(args.ant_petal_order_max),
+            "ant_dynamic_range_min_fraction": float(args.ant_dynamic_range_min_fraction),
+            "ant_db_min": float(args.ant_db_min),
+            "ant_db_max": float(args.ant_db_max),
+            "ant_lobes_min": int(args.ant_lobes_min),
+            "ant_lobes_max": int(args.ant_lobes_max),
+            "ant_lobe_width_deg_min": float(args.ant_lobe_width_deg_min),
+            "ant_lobe_width_deg_max": float(args.ant_lobe_width_deg_max),
+            "ant_smooth_sigma_deg_min": float(args.ant_smooth_sigma_deg_min),
+            "ant_smooth_sigma_deg_max": float(args.ant_smooth_sigma_deg_max),
+            "ant_symmetry_prob": float(args.ant_symmetry_prob),
+            "ant_symmetry_mode": str(args.ant_symmetry_mode),
+            "ant_azimuth_quantization_deg": float(args.ant_azimuth_quantization_deg),
+        }
         _write(sp, {
             "run_dir": rd, "num_workers": nw, "num_samples": total_samples,
             "samples_per_worker": spw, "total_target": total_samples, "global_seed": seed,
             "freq_min": fmin, "freq_max": fmax, "numba_threads": nt,
+            "ant_iso_prob": ant_cfg["ant_iso_prob"],
+            "ant_pattern_model": ant_cfg["ant_pattern_model"],
+            "ant_latent_dim": ant_cfg["ant_latent_dim"],
+            "ant_latent_dim_min": ant_cfg["ant_latent_dim_min"],
+            "ant_latent_dim_max": ant_cfg["ant_latent_dim_max"],
+            "ant_fourier_order": ant_cfg["ant_fourier_order"],
+            "ant_style_front_back_prob": ant_cfg["ant_style_front_back_prob"],
+            "ant_style_bidirectional_prob": ant_cfg["ant_style_bidirectional_prob"],
+            "ant_style_petal_prob": ant_cfg["ant_style_petal_prob"],
+            "ant_style_ripple_prob": ant_cfg["ant_style_ripple_prob"],
+            "ant_petal_order_min": ant_cfg["ant_petal_order_min"],
+            "ant_petal_order_max": ant_cfg["ant_petal_order_max"],
+            "ant_dynamic_range_min_fraction": ant_cfg["ant_dynamic_range_min_fraction"],
+            "ant_db_min": ant_cfg["ant_db_min"],
+            "ant_db_max": ant_cfg["ant_db_max"],
+            "ant_lobes_min": ant_cfg["ant_lobes_min"],
+            "ant_lobes_max": ant_cfg["ant_lobes_max"],
+            "ant_lobe_width_deg_min": ant_cfg["ant_lobe_width_deg_min"],
+            "ant_lobe_width_deg_max": ant_cfg["ant_lobe_width_deg_max"],
+            "ant_smooth_sigma_deg_min": ant_cfg["ant_smooth_sigma_deg_min"],
+            "ant_smooth_sigma_deg_max": ant_cfg["ant_smooth_sigma_deg_max"],
+            "ant_symmetry_prob": ant_cfg["ant_symmetry_prob"],
+            "ant_symmetry_mode": ant_cfg["ant_symmetry_mode"],
+            "ant_azimuth_quantization_deg": ant_cfg["ant_azimuth_quantization_deg"],
             "created_utc": _now(), "orchestrator_pid": os.getpid(),
         })
 
     log.info(f"Run: {rd}  workers={nw}  num_samples={total_samples}  samples/worker={spw}  seed={seed}")
+    log.info(
+        "Antenna: model=%s d=%s d_range=[%s,%s] K=%s p_iso=%s db=[%s,%s] styles=[fb=%s,bi=%s,petal=%s,ripple=%s] petals=[%s,%s] "
+        "lobes=[%s,%s] width_deg=[%s,%s] smooth_sigma_deg=[%s,%s] sym=%s p_sym=%s az_quant=%s",
+        ant_cfg["ant_pattern_model"],
+        ant_cfg["ant_latent_dim"],
+        ant_cfg["ant_latent_dim_min"],
+        ant_cfg["ant_latent_dim_max"],
+        ant_cfg["ant_fourier_order"],
+        ant_cfg["ant_iso_prob"],
+        ant_cfg["ant_db_min"],
+        ant_cfg["ant_db_max"],
+        ant_cfg["ant_style_front_back_prob"],
+        ant_cfg["ant_style_bidirectional_prob"],
+        ant_cfg["ant_style_petal_prob"],
+        ant_cfg["ant_style_ripple_prob"],
+        ant_cfg["ant_petal_order_min"],
+        ant_cfg["ant_petal_order_max"],
+        ant_cfg["ant_lobes_min"],
+        ant_cfg["ant_lobes_max"],
+        ant_cfg["ant_lobe_width_deg_min"],
+        ant_cfg["ant_lobe_width_deg_max"],
+        ant_cfg["ant_smooth_sigma_deg_min"],
+        ant_cfg["ant_smooth_sigma_deg_max"],
+        ant_cfg["ant_symmetry_mode"],
+        ant_cfg["ant_symmetry_prob"],
+        ant_cfg["ant_azimuth_quantization_deg"],
+    )
     if not args.no_ui:
         log.info(f"Streamlit URL: http://localhost:{port}")
 
@@ -587,7 +777,7 @@ def cmd_start(args):
         wid = f"worker_{i:03d}"
         sb = seed + i * spw
         log.info(f"  Starting {wid} (seed_base={sb})")
-        _launch_worker(rd, wid, spw, sb, fmin, fmax, nt)
+        _launch_worker(rd, wid, spw, sb, fmin, fmax, nt, ant_cfg)
 
     # Streamlit
     st_proc = None
@@ -669,7 +859,7 @@ def cmd_start(args):
                     sb = seed + i * spw
                     _clear_inline_progress()
                     log.warning(f"{wid} dead (PID {m.get('pid')}). Restarting...")
-                    _launch_worker(rd, wid, spw, sb, fmin, fmax, nt)
+                    _launch_worker(rd, wid, spw, sb, fmin, fmax, nt, ant_cfg)
 
             _emit_progress(tg, tr, total_samples)
             if all_done:
@@ -736,6 +926,22 @@ def cmd_status(args):
     print(f"Run: {rd}")
     print(f"Workers: {nw}  Samples/worker: {spw}  Total: {total_samples}")
     print(f"Seed: {st.get('global_seed')}  Freq: [{st.get('freq_min')}, {st.get('freq_max')}] MHz\n")
+    print(
+        "Antenna: "
+        f"model={st.get('ant_pattern_model', DEFAULT_ANT_PATTERN_MODEL)} "
+        f"d={st.get('ant_latent_dim', DEFAULT_ANT_LATENT_DIM)} "
+        f"d_range=[{st.get('ant_latent_dim_min', DEFAULT_ANT_LATENT_DIM_MIN)},{st.get('ant_latent_dim_max', DEFAULT_ANT_LATENT_DIM_MAX)}] "
+        f"K={st.get('ant_fourier_order', DEFAULT_ANT_FOURIER_ORDER)} "
+        f"p_iso={st.get('ant_iso_prob', DEFAULT_ANT_ISO_PROB)} "
+        f"db=[{st.get('ant_db_min', DEFAULT_ANT_DB_MIN)}, {st.get('ant_db_max', DEFAULT_ANT_DB_MAX)}] "
+        f"styles=[fb={st.get('ant_style_front_back_prob', DEFAULT_ANT_STYLE_FRONT_BACK_PROB)},"
+        f"bi={st.get('ant_style_bidirectional_prob', DEFAULT_ANT_STYLE_BIDIRECTIONAL_PROB)},"
+        f"petal={st.get('ant_style_petal_prob', DEFAULT_ANT_STYLE_PETAL_PROB)},"
+        f"ripple={st.get('ant_style_ripple_prob', DEFAULT_ANT_STYLE_RIPPLE_PROB)}] "
+        f"lobes=[{st.get('ant_lobes_min', DEFAULT_ANT_LOBES_MIN)}, {st.get('ant_lobes_max', DEFAULT_ANT_LOBES_MAX)}] "
+        f"sym={st.get('ant_symmetry_mode', DEFAULT_ANT_SYMMETRY_MODE)} "
+        f"p_sym={st.get('ant_symmetry_prob', DEFAULT_ANT_SYMMETRY_PROB)}\n"
+    )
 
     rows, tg = [], 0
     for i in range(nw):
@@ -914,6 +1120,30 @@ def main():
     s.add_argument("--num-samples", type=int, default=DEFAULT_NUM_SAMPLES)
     s.add_argument("--dry-run", action="store_true")
     s.add_argument("--no-ui", action="store_true")
+    s.add_argument("--ant-iso-prob", type=float, default=DEFAULT_ANT_ISO_PROB)
+    s.add_argument("--ant-pattern-model", type=str, default=DEFAULT_ANT_PATTERN_MODEL, choices=["latent_fourier", "gaussian_lobes"])
+    s.add_argument("--ant-latent-dim", type=int, default=DEFAULT_ANT_LATENT_DIM)
+    s.add_argument("--ant-latent-dim-min", type=int, default=DEFAULT_ANT_LATENT_DIM_MIN)
+    s.add_argument("--ant-latent-dim-max", type=int, default=DEFAULT_ANT_LATENT_DIM_MAX)
+    s.add_argument("--ant-fourier-order", type=int, default=DEFAULT_ANT_FOURIER_ORDER)
+    s.add_argument("--ant-style-front-back-prob", type=float, default=DEFAULT_ANT_STYLE_FRONT_BACK_PROB)
+    s.add_argument("--ant-style-bidirectional-prob", type=float, default=DEFAULT_ANT_STYLE_BIDIRECTIONAL_PROB)
+    s.add_argument("--ant-style-petal-prob", type=float, default=DEFAULT_ANT_STYLE_PETAL_PROB)
+    s.add_argument("--ant-style-ripple-prob", type=float, default=DEFAULT_ANT_STYLE_RIPPLE_PROB)
+    s.add_argument("--ant-petal-order-min", type=int, default=DEFAULT_ANT_PETAL_ORDER_MIN)
+    s.add_argument("--ant-petal-order-max", type=int, default=DEFAULT_ANT_PETAL_ORDER_MAX)
+    s.add_argument("--ant-dynamic-range-min-fraction", type=float, default=DEFAULT_ANT_DYNAMIC_RANGE_MIN_FRACTION)
+    s.add_argument("--ant-db-min", type=float, default=DEFAULT_ANT_DB_MIN)
+    s.add_argument("--ant-db-max", type=float, default=DEFAULT_ANT_DB_MAX)
+    s.add_argument("--ant-lobes-min", type=int, default=DEFAULT_ANT_LOBES_MIN)
+    s.add_argument("--ant-lobes-max", type=int, default=DEFAULT_ANT_LOBES_MAX)
+    s.add_argument("--ant-lobe-width-deg-min", type=float, default=DEFAULT_ANT_LOBE_WIDTH_DEG_MIN)
+    s.add_argument("--ant-lobe-width-deg-max", type=float, default=DEFAULT_ANT_LOBE_WIDTH_DEG_MAX)
+    s.add_argument("--ant-smooth-sigma-deg-min", type=float, default=DEFAULT_ANT_SMOOTH_SIGMA_DEG_MIN)
+    s.add_argument("--ant-smooth-sigma-deg-max", type=float, default=DEFAULT_ANT_SMOOTH_SIGMA_DEG_MAX)
+    s.add_argument("--ant-symmetry-prob", type=float, default=DEFAULT_ANT_SYMMETRY_PROB)
+    s.add_argument("--ant-symmetry-mode", type=str, default=DEFAULT_ANT_SYMMETRY_MODE, choices=["random", "none", "x", "y", "xy"])
+    s.add_argument("--ant-azimuth-quantization-deg", type=float, default=DEFAULT_ANT_AZIMUTH_QUANTIZATION_DEG)
 
     s = sub.add_parser("status", help="Print status snapshot")
     s.add_argument("--run-dir", default=None)
@@ -927,6 +1157,30 @@ def main():
     s.add_argument("--freq-max", type=int, default=10000)
     s.add_argument("--numba-threads", type=int, default=1)
     s.add_argument("--instance-id", required=True)
+    s.add_argument("--ant-iso-prob", type=float, default=DEFAULT_ANT_ISO_PROB)
+    s.add_argument("--ant-pattern-model", type=str, default=DEFAULT_ANT_PATTERN_MODEL, choices=["latent_fourier", "gaussian_lobes"])
+    s.add_argument("--ant-latent-dim", type=int, default=DEFAULT_ANT_LATENT_DIM)
+    s.add_argument("--ant-latent-dim-min", type=int, default=DEFAULT_ANT_LATENT_DIM_MIN)
+    s.add_argument("--ant-latent-dim-max", type=int, default=DEFAULT_ANT_LATENT_DIM_MAX)
+    s.add_argument("--ant-fourier-order", type=int, default=DEFAULT_ANT_FOURIER_ORDER)
+    s.add_argument("--ant-style-front-back-prob", type=float, default=DEFAULT_ANT_STYLE_FRONT_BACK_PROB)
+    s.add_argument("--ant-style-bidirectional-prob", type=float, default=DEFAULT_ANT_STYLE_BIDIRECTIONAL_PROB)
+    s.add_argument("--ant-style-petal-prob", type=float, default=DEFAULT_ANT_STYLE_PETAL_PROB)
+    s.add_argument("--ant-style-ripple-prob", type=float, default=DEFAULT_ANT_STYLE_RIPPLE_PROB)
+    s.add_argument("--ant-petal-order-min", type=int, default=DEFAULT_ANT_PETAL_ORDER_MIN)
+    s.add_argument("--ant-petal-order-max", type=int, default=DEFAULT_ANT_PETAL_ORDER_MAX)
+    s.add_argument("--ant-dynamic-range-min-fraction", type=float, default=DEFAULT_ANT_DYNAMIC_RANGE_MIN_FRACTION)
+    s.add_argument("--ant-db-min", type=float, default=DEFAULT_ANT_DB_MIN)
+    s.add_argument("--ant-db-max", type=float, default=DEFAULT_ANT_DB_MAX)
+    s.add_argument("--ant-lobes-min", type=int, default=DEFAULT_ANT_LOBES_MIN)
+    s.add_argument("--ant-lobes-max", type=int, default=DEFAULT_ANT_LOBES_MAX)
+    s.add_argument("--ant-lobe-width-deg-min", type=float, default=DEFAULT_ANT_LOBE_WIDTH_DEG_MIN)
+    s.add_argument("--ant-lobe-width-deg-max", type=float, default=DEFAULT_ANT_LOBE_WIDTH_DEG_MAX)
+    s.add_argument("--ant-smooth-sigma-deg-min", type=float, default=DEFAULT_ANT_SMOOTH_SIGMA_DEG_MIN)
+    s.add_argument("--ant-smooth-sigma-deg-max", type=float, default=DEFAULT_ANT_SMOOTH_SIGMA_DEG_MAX)
+    s.add_argument("--ant-symmetry-prob", type=float, default=DEFAULT_ANT_SYMMETRY_PROB)
+    s.add_argument("--ant-symmetry-mode", type=str, default=DEFAULT_ANT_SYMMETRY_MODE, choices=["random", "none", "x", "y", "xy"])
+    s.add_argument("--ant-azimuth-quantization-deg", type=float, default=DEFAULT_ANT_AZIMUTH_QUANTIZATION_DEG)
 
     s = sub.add_parser("dashboard", help="(internal) streamlit UI")
 
