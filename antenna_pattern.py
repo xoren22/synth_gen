@@ -265,7 +265,7 @@ def _generate_gaussian_lobe_pattern(rng: np.random.Generator, cfg: RadiationPatt
     sigma_max = float(max(sigma_min, cfg.smooth_sigma_deg_max))
     losses = _smooth_circular(losses, float(rng.uniform(sigma_min, sigma_max)))
     gains = -np.clip(losses, min_loss, max_loss)
-    return gains, "gaussian_lobes"
+    return gains, "gaussian_lobes", n_lobes
 
 
 def generate_radiation_pattern(rng: np.random.Generator, cfg: RadiationPatternConfig) -> RadiationPatternSample:
@@ -276,7 +276,10 @@ def generate_radiation_pattern(rng: np.random.Generator, cfg: RadiationPatternCo
         model = "latent_fourier"
     dmin = int(max(2, cfg.latent_dim_min))
     dmax = int(max(dmin, cfg.latent_dim_max))
-    sampled_d = int(rng.integers(dmin, dmax + 1))
+    if dmin == dmax:
+        sampled_d = int(max(2, cfg.latent_dim))
+    else:
+        sampled_d = int(rng.integers(dmin, dmax + 1))
 
     if rng.random() < p_iso:
         return RadiationPatternSample(
@@ -296,8 +299,8 @@ def generate_radiation_pattern(rng: np.random.Generator, cfg: RadiationPatternCo
 
     symmetry = _resolve_symmetry_mode(rng, cfg)
     if model == "gaussian_lobes":
-        losses, style = _generate_gaussian_lobe_pattern(rng, cfg, azimuth_deg=az, symmetry=symmetry)
-        complexity_dim = int(max(1, cfg.lobe_count_max))
+        losses, style, n_lobes = _generate_gaussian_lobe_pattern(rng, cfg, azimuth_deg=az, symmetry=symmetry)
+        complexity_dim = n_lobes
     else:
         losses, style = _generate_latent_fourier_pattern(
             rng,

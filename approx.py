@@ -45,14 +45,13 @@ def _build_ray_initial_losses(sample: RadarSample, n_angles: int) -> np.ndarray:
     if pat_np.size == 1:
         return np.full(n_angles, float(pat_np[0]), dtype=np.float64)
 
-    az = float(getattr(sample, "azimuth", 0.0))
     theta = np.arange(n_angles, dtype=np.float64) * (360.0 / float(n_angles))
-    query = (az - theta) % 360.0
+    query = theta % 360.0
     pos = query * (float(pat_np.size) / 360.0)
     i0 = np.floor(pos).astype(np.int64) % pat_np.size
     i1 = (i0 + 1) % pat_np.size
     t = pos - np.floor(pos)
-    out = (1.0 - t) * pat_np[i0] + t * pat_np[i1]
+    out = -((1.0 - t) * pat_np[i0] + t * pat_np[i1])
     return np.ascontiguousarray(out, dtype=np.float64)
 
 
@@ -77,13 +76,12 @@ def _build_pixel_initial_loss_map(sample: RadarSample) -> np.ndarray:
         return np.full((H, W), float(pat_np[0]), dtype=np.float64)
 
     yy, xx = np.meshgrid(np.arange(H, dtype=np.float64), np.arange(W, dtype=np.float64), indexing="ij")
-    az = float(getattr(sample, "azimuth", 0.0))
-    theta = (-(180.0 / np.pi) * np.arctan2((sample.y_ant - yy), (sample.x_ant - xx)) + 180.0 + az) % 360.0
+    theta = np.degrees(np.arctan2(yy - sample.y_ant, xx - sample.x_ant)) % 360.0
     pos = theta * (float(pat_np.size) / 360.0)
     i0 = np.floor(pos).astype(np.int64) % pat_np.size
     i1 = (i0 + 1) % pat_np.size
     t = pos - np.floor(pos)
-    out = (1.0 - t) * pat_np[i0] + t * pat_np[i1]
+    out = -((1.0 - t) * pat_np[i0] + t * pat_np[i1])
     return np.ascontiguousarray(out, dtype=np.float64)
 
 
