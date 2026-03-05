@@ -24,6 +24,69 @@ def _to_numpy_2d(arr):
     return np.asarray(arr)
 
 
+def _build_ray_initial_losses(sample: RadarSample, n_angles: int) -> np.ndarray:
+    """
+    Build per-ray initial pathloss terms from sample radiation pattern.
+    Ray direction i uses angle theta_i=i*360/n; pattern lookup follows the same
+    azimuth convention as featurizer-side antenna gain: index=(azimuth-theta) mod 360.
+    """
+    if n_angles <= 0:
+        return np.zeros(0, dtype=np.float64)
+    pat = getattr(sample, "radiation_pattern", None)
+    if pat is None:
+        return np.zeros(n_angles, dtype=np.float64)
+    if isinstance(pat, torch.Tensor):
+        pat_np = pat.detach().cpu().numpy()
+    else:
+        pat_np = np.asarray(pat)
+    pat_np = np.asarray(pat_np, dtype=np.float64).reshape(-1)
+    if pat_np.size == 0:
+        return np.zeros(n_angles, dtype=np.float64)
+    if pat_np.size == 1:
+        return np.full(n_angles, float(pat_np[0]), dtype=np.float64)
+
+    az = float(getattr(sample, "azimuth", 0.0))
+    theta = np.arange(n_angles, dtype=np.float64) * (360.0 / float(n_angles))
+    query = (az - theta) % 360.0
+    pos = query * (float(pat_np.size) / 360.0)
+    i0 = np.floor(pos).astype(np.int64) % pat_np.size
+    i1 = (i0 + 1) % pat_np.size
+    t = pos - np.floor(pos)
+    out = (1.0 - t) * pat_np[i0] + t * pat_np[i1]
+    return np.ascontiguousarray(out, dtype=np.float64)
+
+
+def _build_pixel_initial_loss_map(sample: RadarSample) -> np.ndarray:
+    """
+    Per-pixel directional initial term from antenna pattern using the same
+    angle convention as featurizer-side antenna gain indexing.
+    """
+    H = int(sample.H)
+    W = int(sample.W)
+    pat = getattr(sample, "radiation_pattern", None)
+    if pat is None:
+        return np.zeros((H, W), dtype=np.float64)
+    if isinstance(pat, torch.Tensor):
+        pat_np = pat.detach().cpu().numpy()
+    else:
+        pat_np = np.asarray(pat)
+    pat_np = np.asarray(pat_np, dtype=np.float64).reshape(-1)
+    if pat_np.size == 0:
+        return np.zeros((H, W), dtype=np.float64)
+    if pat_np.size == 1:
+        return np.full((H, W), float(pat_np[0]), dtype=np.float64)
+
+    yy, xx = np.meshgrid(np.arange(H, dtype=np.float64), np.arange(W, dtype=np.float64), indexing="ij")
+    az = float(getattr(sample, "azimuth", 0.0))
+    theta = (-(180.0 / np.pi) * np.arctan2((sample.y_ant - yy), (sample.x_ant - xx)) + 180.0 + az) % 360.0
+    pos = theta * (float(pat_np.size) / 360.0)
+    i0 = np.floor(pos).astype(np.int64) % pat_np.size
+    i1 = (i0 + 1) % pat_np.size
+    t = pos - np.floor(pos)
+    out = (1.0 - t) * pat_np[i0] + t * pat_np[i1]
+    return np.ascontiguousarray(out, dtype=np.float64)
+
+
 def _normals_from_sample(sample, ref=None, trans=None):
     """Extract (nx_img, ny_img) float64 arrays from a RadarSample.
 
@@ -91,7 +154,17 @@ def _fspl_from_lut(lut: np.ndarray, step_index: int) -> float:
 
 
 @njit(parallel=True, cache=False)
-def _backfill_direct_los(out: np.ndarray, cnt: np.ndarray, trans_mat: np.ndarray, x_ant: float, y_ant: float, pixel_size: float, freq_MHz: float, max_loss: float) -> np.ndarray:
+def _backfill_direct_los(
+    out: np.ndarray,
+    cnt: np.ndarray,
+    trans_mat: np.ndarray,
+    antenna_init_map: np.ndarray,
+    x_ant: float,
+    y_ant: float,
+    pixel_size: float,
+    freq_MHz: float,
+    max_loss: float,
+) -> np.ndarray:
     h, w = out.shape
     out2 = out.copy()
     mask0 = (cnt == 0)
@@ -118,7 +191,7 @@ def _backfill_direct_los(out: np.ndarray, cnt: np.ndarray, trans_mat: np.ndarray
                 if dist < 0.125:
                     dist = 0.125
                 fspl = 20.0 * np.log10(dist) + 20.0 * np.log10(freq_MHz) - 27.55
-                tot = fspl
+                tot = fspl + float(antenna_init_map[py, px])
                 if tot > max_loss:
                     tot = max_loss
                 out2[py, px] = tot
@@ -160,7 +233,7 @@ def _backfill_direct_los(out: np.ndarray, cnt: np.ndarray, trans_mat: np.ndarray
             if dist < 0.125:
                 dist = 0.125
             fspl = 20.0 * np.log10(dist) + 20.0 * np.log10(freq_MHz) - 27.55
-            tot = sum_loss + fspl
+            tot = sum_loss + fspl + float(antenna_init_map[py, px])
             if tot > max_loss:
                 tot = max_loss
             out2[py, px] = tot
@@ -169,10 +242,23 @@ def _backfill_direct_los(out: np.ndarray, cnt: np.ndarray, trans_mat: np.ndarray
     return out2.astype(np.float32)
 
 
-def apply_backfill(out: np.ndarray, cnt: np.ndarray, x_ant: float, y_ant: float, pixel_size: float, freq_MHz: float, max_loss: float, *, trans_mat: np.ndarray | None = None) -> np.ndarray:
+def apply_backfill(
+    out: np.ndarray,
+    cnt: np.ndarray,
+    x_ant: float,
+    y_ant: float,
+    pixel_size: float,
+    freq_MHz: float,
+    max_loss: float,
+    *,
+    trans_mat: np.ndarray | None = None,
+    antenna_init_map: np.ndarray | None = None,
+) -> np.ndarray:
     if trans_mat is None:
         raise ValueError("LOS backfill requires trans_mat")
-    return _backfill_direct_los(out, cnt, trans_mat, x_ant, y_ant, pixel_size, freq_MHz, max_loss)
+    if antenna_init_map is None:
+        antenna_init_map = np.zeros_like(trans_mat, dtype=np.float64)
+    return _backfill_direct_los(out, cnt, trans_mat, antenna_init_map, x_ant, y_ant, pixel_size, freq_MHz, max_loss)
 
 # ---------------------------------------------------------------------#
 #  STEP-UNTIL-WALL                                                     #
@@ -327,6 +413,7 @@ def _trace_ray_recursive(
 def calculate_combined_loss_with_normals(
     reflectance_mat, transmittance_mat, nx_img, ny_img,
     x_ant, y_ant, freq_MHz,
+    ray_init_losses,
     n_angles,
     max_refl=MAX_REFL, max_trans=MAX_TRANS,
     pixel_size=0.25,
@@ -358,7 +445,7 @@ def calculate_combined_loss_with_normals(
             x_ant, y_ant,
             cos_v[i], sin_v[i],
             0, 0,
-            0.0, 0.0,
+            ray_init_losses[i], 0.0,
             pixel_size, freq_MHz,
             radial_step, max_dist,
             max_trans, max_refl, max_loss,
@@ -375,9 +462,11 @@ def _warmup_numba_once():
     zero = np.zeros((h, w), np.float64)
     trans = zero.copy(); trans[:, 4] = 1.0
     nx = zero.copy(); ny = zero.copy(); ny[:, 4] = 1.0
+    ray_init = np.zeros(N_ANGLES, np.float64)
     calculate_combined_loss_with_normals(
         zero, trans, nx, ny,
         x_ant=4.0, y_ant=4.0, freq_MHz=1000.0,
+        ray_init_losses=ray_init,
         n_angles=N_ANGLES,
         max_refl=0, max_trans=1,
         radial_step=1.0,
@@ -386,7 +475,8 @@ def _warmup_numba_once():
     # Warm up parallel backfill (recompiles with parallel=True)
     out_w = np.full((h, w), 32000.0, np.float32)
     cnt_w = np.zeros((h, w), np.float32)
-    _backfill_direct_los(out_w, cnt_w, trans, 4.0, 4.0, 0.25, 1000.0, 32000.0)
+    ant_init_w = np.zeros((h, w), np.float64)
+    _backfill_direct_los(out_w, cnt_w, trans, ant_init_w, 4.0, 4.0, 0.25, 1000.0, 32000.0)
     _WARMED_UP = True
 
 # ---------------------------------------------------------------------#
@@ -416,11 +506,17 @@ class Approx:
         trans_c = np.ascontiguousarray(trans, dtype=np.float64)
         t_contiguous = time.perf_counter() - t0
 
+        t0 = time.perf_counter()
+        ray_init = _build_ray_initial_losses(sample, N_ANGLES)
+        pix_init = _build_pixel_initial_loss_map(sample)
+        t_ant = time.perf_counter() - t0
+
         if self.method == 'combined':
             t0 = time.perf_counter()
             feat, cnt = calculate_combined_loss_with_normals(
                 ref_c, trans_c, nx_img, ny_img,
                 x, y, f,
+                ray_init_losses=ray_init,
                 n_angles=N_ANGLES,
                 max_refl=max_refl,
                 max_trans=max_trans,
@@ -430,16 +526,44 @@ class Approx:
             t_raytrace = time.perf_counter() - t0
 
             t0 = time.perf_counter()
-            feat = apply_backfill(feat, cnt, x, y, 0.25, f, 32000.0, trans_mat=trans_c)
+            feat = apply_backfill(
+                feat,
+                cnt,
+                x,
+                y,
+                0.25,
+                f,
+                32000.0,
+                trans_mat=trans_c,
+                antenna_init_map=pix_init,
+            )
             t_backfill = time.perf_counter() - t0
         else:
             t0 = time.perf_counter()
-            feat, cnt = calculate_transmission_loss_numpy(trans_c, x, y, f, n_angles=360*128, max_walls=max_trans)
+            feat, cnt = calculate_transmission_loss_numpy(
+                trans_c,
+                x,
+                y,
+                f,
+                ray_init,
+                n_angles=360 * 128,
+                max_walls=max_trans,
+            )
             t_raytrace = time.perf_counter() - t0
 
             t0 = time.perf_counter()
             feat = feat.astype(np.float32)
-            feat = apply_backfill(feat, cnt.astype(np.float32), x, y, 0.25, f, 32000.0, trans_mat=trans_c)
+            feat = apply_backfill(
+                feat,
+                cnt.astype(np.float32),
+                x,
+                y,
+                0.25,
+                f,
+                32000.0,
+                trans_mat=trans_c,
+                antenna_init_map=pix_init,
+            )
             t_backfill = time.perf_counter() - t0
 
         t0 = time.perf_counter()
@@ -450,9 +574,9 @@ class Approx:
         t_total = time.perf_counter() - t_start
         logger.debug(
             "approximate [%dx%d] total=%.4fs | extract=%.4fs normals=%.4fs "
-            "contiguous=%.4fs raytrace=%.4fs backfill=%.4fs finalize=%.4fs",
+            "contiguous=%.4fs ant=%.4fs raytrace=%.4fs backfill=%.4fs finalize=%.4fs",
             sample.H, sample.W, t_total, t_extract, t_normals,
-            t_contiguous, t_raytrace, t_backfill, t_finalize
+            t_contiguous, t_ant, t_raytrace, t_backfill, t_finalize
         )
         return result
 
@@ -479,7 +603,18 @@ class Approx:
 
 
 @njit(parallel=True, fastmath=True, nogil=True, boundscheck=False)
-def calculate_transmission_loss_numpy(trans_mat, x_ant, y_ant, freq_MHz, n_angles=360*128, radial_step=1.0, max_walls=MAX_TRANS, max_loss=32000.0, pixel_size=0.25):
+def calculate_transmission_loss_numpy(
+    trans_mat,
+    x_ant,
+    y_ant,
+    freq_MHz,
+    ray_init_losses,
+    n_angles=360 * 128,
+    radial_step=1.0,
+    max_walls=MAX_TRANS,
+    max_loss=32000.0,
+    pixel_size=0.25,
+):
 
     h, w  = trans_mat.shape
     out   = np.full((h,w), max_loss, np.float64)
@@ -492,7 +627,7 @@ def calculate_transmission_loss_numpy(trans_mat, x_ant, y_ant, freq_MHz, n_angle
 
     for i in prange(n_angles):
         ct, st = cos_v[i], sin_v[i]
-        sum_loss = 0.0; last_val = None; wall_ct = 0; r=0.0
+        sum_loss = ray_init_losses[i]; last_val = None; wall_ct = 0; r=0.0
 
         while r<=max_dist:
             x = x_ant + r*ct; y = y_ant + r*st
