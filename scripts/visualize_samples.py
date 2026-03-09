@@ -13,15 +13,48 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
+def _decode_meta_json_from_npz(data):
+    """Decode embedded metadata from a loaded npz payload."""
+    if "meta_json" not in data.files:
+        return None
+
+    raw = data["meta_json"]
+    if isinstance(raw, np.ndarray):
+        if raw.ndim == 0:
+            raw = raw.item()
+        else:
+            raw = "".join(str(x) for x in raw.tolist())
+
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    elif not isinstance(raw, str):
+        raw = str(raw)
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
 def load_sample(sample_dir):
-    """Load arrays and metadata from a sample directory."""
+    """Load arrays and metadata from a sample directory.
+
+    Supports both formats:
+    - New: metadata embedded under npz key 'meta_json'
+    - Old: sidecar *.json file alongside *.npz
+    """
     npz_files = [f for f in os.listdir(sample_dir) if f.endswith(".npz")]
-    json_files = [f for f in os.listdir(sample_dir) if f.endswith(".json")]
-    if not npz_files or not json_files:
+    if not npz_files:
         return None, None
+
     data = np.load(os.path.join(sample_dir, npz_files[0]))
-    with open(os.path.join(sample_dir, json_files[0])) as f:
-        meta = json.load(f)
+    meta = _decode_meta_json_from_npz(data)
+    if meta is None:
+        json_files = [f for f in os.listdir(sample_dir) if f.endswith(".json")]
+        if not json_files:
+            return None, None
+        with open(os.path.join(sample_dir, json_files[0])) as f:
+            meta = json.load(f)
     return data, meta
 
 

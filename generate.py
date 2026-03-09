@@ -19,15 +19,15 @@ from antenna_pattern import RadiationPatternConfig, generate_radiation_pattern
 
 
 
-def _export_sample_npz_json(out_root: str, sample_name: str, arrays: dict, metadata: dict) -> tuple[str, str]:
+def _export_sample_npz_json(out_root: str, sample_name: str, arrays: dict, metadata: dict) -> str:
 	"""
-	Save arrays to {out_root}/{sample_name}/{sample_name}.npz (compressed) and metadata JSON alongside.
-	Returns (npz_path, json_path).
+	Save arrays and metadata to {out_root}/{sample_name}/{sample_name}.npz (compressed).
+	Metadata is stored under the 'meta_json' key as a JSON string.
+	Returns npz_path.
 	"""
 	sample_dir = os.path.join(out_root, sample_name)
 	os.makedirs(sample_dir, exist_ok=True)
 	npz_path = os.path.join(sample_dir, f"{sample_name}.npz")
-	json_path = os.path.join(sample_dir, f"{sample_name}.json")
 
 	# Normalize dtypes for compact storage; preserve float16 as-is
 	np_arrays = {}
@@ -45,10 +45,9 @@ def _export_sample_npz_json(out_root: str, sample_name: str, arrays: dict, metad
 			raise TypeError(f"Array value for key '{key}' must be a numpy array or tensor, got {type(val)}")
 
 	with open(npz_path, "wb") as f:
-		np.savez_compressed(f, **np_arrays)
-	with open(json_path, "w") as f:
-		json.dump(metadata, f, indent=2)
-	return npz_path, json_path
+		meta_json = json.dumps(metadata, separators=(",", ":"))
+		np.savez_compressed(f, **np_arrays, meta_json=np.asarray(meta_json))
+	return npz_path
 
 
 def _ensure_unique_run_dir(base_root: str, desired_run_id: str | None) -> tuple[str, str]:
@@ -212,30 +211,22 @@ def main():
 	parser.add_argument('--out_root', type=str, default=None, help='Root directory for streamed outputs (default: <repo>/data)')
 	parser.add_argument('--freq_min', type=int, default=400, help='Minimum frequency in MHz for uniform sampling')
 	parser.add_argument('--freq_max', type=int, default=10_000, help='Maximum frequency in MHz for uniform sampling')
-	parser.add_argument('--ant_iso_prob', type=float, default=1.0, help='Probability of isotropic antenna pattern')
-	parser.add_argument('--ant_pattern_model', type=str, default='latent_fourier', choices=['latent_fourier', 'gaussian_lobes'], help='Pattern generator model')
-	parser.add_argument('--ant_latent_dim', type=int, default=10, help='Latent dimension d for latent_fourier model')
-	parser.add_argument('--ant_latent_dim_min', type=int, default=10, help='Minimum latent dimension d (uniformly sampled per sample)')
-	parser.add_argument('--ant_latent_dim_max', type=int, default=10, help='Maximum latent dimension d (uniformly sampled per sample)')
-	parser.add_argument('--ant_fourier_order', type=int, default=14, help='Number of Fourier harmonics for latent_fourier model')
-	parser.add_argument('--ant_style_front_back_prob', type=float, default=0.25, help='Style mixture probability: front_back')
-	parser.add_argument('--ant_style_bidirectional_prob', type=float, default=0.25, help='Style mixture probability: bidirectional')
-	parser.add_argument('--ant_style_petal_prob', type=float, default=0.30, help='Style mixture probability: petal')
-	parser.add_argument('--ant_style_ripple_prob', type=float, default=0.20, help='Style mixture probability: ripple')
+	parser.add_argument('--ant_iso_prob', type=float, default=0.25, help='Probability of isotropic antenna pattern')
+	parser.add_argument('--ant_pattern_model', type=str, default='random', choices=['random', 'latent_fourier', 'gaussian_lobes'], help='Pattern generator model (random chooses per sample)')
+	parser.add_argument('--ant_latent_dim_min', type=int, default=8, help='Minimum latent dimension d (uniformly sampled per sample)')
+	parser.add_argument('--ant_latent_dim_max', type=int, default=20, help='Maximum latent dimension d (uniformly sampled per sample)')
+	parser.add_argument('--ant_fourier_order_min', type=int, default=10, help='Minimum Fourier harmonics K (uniform per sample)')
+	parser.add_argument('--ant_fourier_order_max', type=int, default=24, help='Maximum Fourier harmonics K (uniform per sample)')
 	parser.add_argument('--ant_petal_order_min', type=int, default=3, help='Minimum petal count for petal style')
-	parser.add_argument('--ant_petal_order_max', type=int, default=8, help='Maximum petal count for petal style')
-	parser.add_argument('--ant_dynamic_range_min_fraction', type=float, default=0.35, help='Minimum fraction of [db_min, db_max] dynamic range to use')
-	parser.add_argument('--ant_db_min', type=float, default=0.0, help='Minimum dB loss in radiation pattern')
-	parser.add_argument('--ant_db_max', type=float, default=20.0, help='Maximum dB loss in radiation pattern')
+	parser.add_argument('--ant_petal_order_max', type=int, default=12, help='Maximum petal count for petal style')
+	parser.add_argument('--ant_db_max', type=float, default=40.0, help='Maximum dB loss in radiation pattern')
 	parser.add_argument('--ant_lobes_min', type=int, default=2, help='Minimum number of directional lobes for non-isotropic patterns')
-	parser.add_argument('--ant_lobes_max', type=int, default=6, help='Maximum number of directional lobes for non-isotropic patterns')
+	parser.add_argument('--ant_lobes_max', type=int, default=12, help='Maximum number of directional lobes for non-isotropic patterns')
 	parser.add_argument('--ant_lobe_width_deg_min', type=float, default=18.0, help='Minimum lobe width (degrees)')
 	parser.add_argument('--ant_lobe_width_deg_max', type=float, default=80.0, help='Maximum lobe width (degrees)')
 	parser.add_argument('--ant_smooth_sigma_deg_min', type=float, default=2.0, help='Minimum circular smoothing sigma (degrees)')
 	parser.add_argument('--ant_smooth_sigma_deg_max', type=float, default=8.0, help='Maximum circular smoothing sigma (degrees)')
-	parser.add_argument('--ant_symmetry_prob', type=float, default=0.35, help='Probability of applying axial symmetry to non-isotropic patterns')
-	parser.add_argument('--ant_symmetry_mode', type=str, default='random', choices=['random', 'none', 'x', 'y', 'xy'], help='Symmetry mode; random samples among x/y/xy with ant_symmetry_prob')
-	parser.add_argument('--ant_azimuth_quantization_deg', type=float, default=0.0, help='Quantize azimuth to this degree step (0 disables quantization)')
+	parser.add_argument('--ant_symmetry_mode', type=str, default='random', choices=['random', 'none', 'x', 'y', 'xy'], help='Symmetry mode; random samples uniformly among none/x/y/xy')
 	parser.add_argument('--verbose', action='store_true', help='Enable detailed per-step timing logs (DEBUG level)')
 	args = parser.parse_args()
 
@@ -280,46 +271,33 @@ def main():
 		pass
 	pattern_cfg = RadiationPatternConfig(
 		pattern_model=str(args.ant_pattern_model),
-		latent_dim=int(args.ant_latent_dim),
-		latent_dim_min=int(args.ant_latent_dim_min),
-		latent_dim_max=int(args.ant_latent_dim_max),
-		fourier_order=int(args.ant_fourier_order),
-		dynamic_range_min_fraction=float(args.ant_dynamic_range_min_fraction),
-		style_front_back_prob=float(args.ant_style_front_back_prob),
-		style_bidirectional_prob=float(args.ant_style_bidirectional_prob),
-		style_petal_prob=float(args.ant_style_petal_prob),
-		style_ripple_prob=float(args.ant_style_ripple_prob),
-		petal_order_min=int(args.ant_petal_order_min),
-		petal_order_max=int(args.ant_petal_order_max),
-		isotropic_probability=float(args.ant_iso_prob),
-		min_loss_db=float(args.ant_db_min),
-		max_loss_db=float(args.ant_db_max),
+			latent_dim_min=int(args.ant_latent_dim_min),
+			latent_dim_max=int(args.ant_latent_dim_max),
+			fourier_order_min=int(args.ant_fourier_order_min),
+			fourier_order_max=int(args.ant_fourier_order_max),
+			petal_order_min=int(args.ant_petal_order_min),
+			petal_order_max=int(args.ant_petal_order_max),
+			isotropic_probability=float(args.ant_iso_prob),
+			max_loss_db=float(args.ant_db_max),
 		lobe_count_min=int(args.ant_lobes_min),
 		lobe_count_max=int(args.ant_lobes_max),
 		lobe_width_deg_min=float(args.ant_lobe_width_deg_min),
-		lobe_width_deg_max=float(args.ant_lobe_width_deg_max),
-		smooth_sigma_deg_min=float(args.ant_smooth_sigma_deg_min),
-		smooth_sigma_deg_max=float(args.ant_smooth_sigma_deg_max),
-		symmetry_probability=float(args.ant_symmetry_prob),
-		symmetry_mode=str(args.ant_symmetry_mode),
-		azimuth_quantization_deg=float(args.ant_azimuth_quantization_deg),
-	)
+			lobe_width_deg_max=float(args.ant_lobe_width_deg_max),
+			smooth_sigma_deg_min=float(args.ant_smooth_sigma_deg_min),
+			smooth_sigma_deg_max=float(args.ant_smooth_sigma_deg_max),
+			symmetry_mode=str(args.ant_symmetry_mode),
+		)
 	logging.info(
-		"Antenna pattern config: model=%s d=%d d_range=[%d,%d] K=%d p_iso=%.3f db=[%.2f, %.2f] "
-		"styles=[front_back=%.2f,bidirectional=%.2f,petal=%.2f,ripple=%.2f] petals=[%d,%d] "
-		"lobes=[%d,%d] width_deg=[%.1f, %.1f] smooth_sigma_deg=[%.1f, %.1f] symmetry=%s p_sym=%.3f az_quant_deg=%.2f",
+		"Antenna pattern config: model=%s d=[%d,%d] K=[%d,%d] p_iso=%.3f db_max=%.2f "
+		"(effective per-sample max is uniform in [0, db_max]) petals=[%d,%d] lobes=[%d,%d] width_deg=[%.1f, %.1f] "
+		"smooth_sigma_deg=[%.1f, %.1f] symmetry=%s",
 		pattern_cfg.pattern_model,
-		pattern_cfg.latent_dim,
 		pattern_cfg.latent_dim_min,
 		pattern_cfg.latent_dim_max,
-		pattern_cfg.fourier_order,
+		pattern_cfg.fourier_order_min,
+		pattern_cfg.fourier_order_max,
 		pattern_cfg.isotropic_probability,
-		pattern_cfg.min_loss_db,
 		pattern_cfg.max_loss_db,
-		pattern_cfg.style_front_back_prob,
-		pattern_cfg.style_bidirectional_prob,
-		pattern_cfg.style_petal_prob,
-		pattern_cfg.style_ripple_prob,
 		pattern_cfg.petal_order_min,
 		pattern_cfg.petal_order_max,
 		pattern_cfg.lobe_count_min,
@@ -329,8 +307,6 @@ def main():
 		pattern_cfg.smooth_sigma_deg_min,
 		pattern_cfg.smooth_sigma_deg_max,
 		pattern_cfg.symmetry_mode,
-		pattern_cfg.symmetry_probability,
-		pattern_cfg.azimuth_quantization_deg,
 	)
 
 	pbar = tqdm(total=N, desc='Samples')

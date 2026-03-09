@@ -5,11 +5,11 @@ Covers:
   B. Angle convention – azimuth is baked into the pattern, not applied again at lookup
   C. Pixel-ray consistency – pixel map and ray array agree for the same direction
   D. End-to-end – Approx.approximate produces valid output with non-isotropic patterns
-  E. latent_dim fallback – cfg.latent_dim used when latent_dim_min == latent_dim_max
+  E. latent_dim sampling – sampled uniformly from latent_dim_min..latent_dim_max
   F. Gaussian complexity_dim – reflects actual sampled lobe count, not lobe_count_max
 """
 import sys, os
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import numpy as np
 import torch
@@ -57,7 +57,6 @@ _NON_ISO_CFG = RadiationPatternConfig(
     isotropic_probability=0.0,
     max_loss_db=20.0,
     pattern_model="latent_fourier",
-    latent_dim=8,
     latent_dim_min=8,
     latent_dim_max=8,
 )
@@ -295,23 +294,23 @@ class TestEndToEnd:
 # ---------------------------------------------------------------------------
 
 class TestLatentDim:
-    def test_explicit_latent_dim_when_range_degenerate(self):
-        """When latent_dim_min == latent_dim_max, cfg.latent_dim overrides."""
+    def test_degenerate_range_uses_that_value(self):
+        """When latent_dim_min == latent_dim_max, complexity_dim is that fixed value."""
         cfg = RadiationPatternConfig(
             isotropic_probability=0.0,
-            latent_dim=5,
+            pattern_model="latent_fourier",
             latent_dim_min=10,
             latent_dim_max=10,
         )
         rng = np.random.default_rng(42)
         pat = generate_radiation_pattern(rng, cfg)
-        assert pat.complexity_dim == 5
+        assert pat.complexity_dim == 10
 
     def test_range_sampling(self):
         """When latent_dim_min != latent_dim_max, sample from [min, max]."""
         cfg = RadiationPatternConfig(
             isotropic_probability=0.0,
-            latent_dim=5,
+            pattern_model="latent_fourier",
             latent_dim_min=4,
             latent_dim_max=8,
         )
