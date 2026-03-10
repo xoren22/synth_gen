@@ -49,6 +49,13 @@ def _wrap_deg(delta: np.ndarray) -> np.ndarray:
     return (delta + 180.0) % 360.0 - 180.0
 
 
+def _resolve_num_angles(cfg: RadiationPatternConfig) -> int:
+    n = int(cfg.num_angles)
+    if n < 1:
+        raise ValueError(f"num_angles must be >= 1, got {cfg.num_angles}")
+    return n
+
+
 def _circular_interp(arr: np.ndarray, angles_deg: np.ndarray) -> np.ndarray:
     n = arr.shape[0]
     pos = (angles_deg % 360.0) * (n / 360.0)
@@ -161,7 +168,7 @@ def _generate_latent_fourier_pattern(
     latent_dim: int,
     fourier_order: int,
 ) -> tuple[np.ndarray, str]:
-    n = int(max(8, cfg.num_angles))
+    n = _resolve_num_angles(cfg)
     d = int(max(2, latent_dim))
     K = int(max(1, fourier_order))
     theta = np.arange(n, dtype=np.float64) * (360.0 / n)
@@ -204,8 +211,13 @@ def _generate_latent_fourier_pattern(
     return gains, style
 
 
-def _generate_gaussian_lobe_pattern(rng: np.random.Generator, cfg: RadiationPatternConfig, azimuth_deg: float, symmetry: str) -> tuple[np.ndarray, str]:
-    n = int(max(8, cfg.num_angles))
+def _generate_gaussian_lobe_pattern(
+    rng: np.random.Generator,
+    cfg: RadiationPatternConfig,
+    azimuth_deg: float,
+    symmetry: str,
+) -> tuple[np.ndarray, str, int]:
+    n = _resolve_num_angles(cfg)
     theta = np.arange(n, dtype=np.float64) * (360.0 / n)
 
     lmin = int(max(1, cfg.lobe_count_min))
@@ -247,7 +259,7 @@ def _generate_gaussian_lobe_pattern(rng: np.random.Generator, cfg: RadiationPatt
 
 def generate_radiation_pattern(rng: np.random.Generator, cfg: RadiationPatternConfig) -> RadiationPatternSample:
     p_iso = float(np.clip(cfg.isotropic_probability, 0.0, 1.0))
-    n = int(max(8, cfg.num_angles))
+    n = _resolve_num_angles(cfg)
     model_mode = str(cfg.pattern_model).strip().lower()
     if model_mode == "random":
         model = str(rng.choice(np.array(["latent_fourier", "gaussian_lobes"], dtype=object)))

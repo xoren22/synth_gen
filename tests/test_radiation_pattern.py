@@ -354,3 +354,25 @@ class TestGaussianComplexityDim:
         gains, style, n_lobes = result
         assert style == "gaussian_lobes"
         assert 3 <= n_lobes <= 5
+
+
+# ---------------------------------------------------------------------------
+# Test G: num_angles contract
+# ---------------------------------------------------------------------------
+
+class TestNumAngles:
+    def test_num_angles_respected_exactly(self):
+        cfg = RadiationPatternConfig(
+            num_angles=7,
+            isotropic_probability=1.0,
+        )
+        pat = generate_radiation_pattern(np.random.default_rng(0), cfg)
+        assert pat.losses_db.shape == (7,)
+
+    def test_num_angles_must_be_positive(self):
+        cfg = RadiationPatternConfig(
+            num_angles=0,
+            isotropic_probability=1.0,
+        )
+        with pytest.raises(ValueError, match="num_angles must be >= 1"):
+            generate_radiation_pattern(np.random.default_rng(0), cfg)
