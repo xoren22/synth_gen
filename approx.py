@@ -25,64 +25,20 @@ def _to_numpy_2d(arr):
 
 
 def _build_ray_initial_losses(sample: RadarSample, n_angles: int) -> np.ndarray:
-    """
-    Build per-ray initial pathloss terms from sample radiation pattern.
-    Ray direction i uses angle theta_i=i*360/n; pattern lookup follows the same
-    azimuth convention as featurizer-side antenna gain: index=(azimuth-theta) mod 360.
-    """
     if n_angles <= 0:
         return np.zeros(0, dtype=np.float64)
-    pat = getattr(sample, "radiation_pattern", None)
-    if pat is None:
-        return np.zeros(n_angles, dtype=np.float64)
-    if isinstance(pat, torch.Tensor):
-        pat_np = pat.detach().cpu().numpy()
-    else:
-        pat_np = np.asarray(pat)
-    pat_np = np.asarray(pat_np, dtype=np.float64).reshape(-1)
-    if pat_np.size == 0:
-        return np.zeros(n_angles, dtype=np.float64)
-    if pat_np.size == 1:
-        return np.full(n_angles, float(pat_np[0]), dtype=np.float64)
-
-    theta = np.arange(n_angles, dtype=np.float64) * (360.0 / float(n_angles))
-    query = theta % 360.0
-    pos = query * (float(pat_np.size) / 360.0)
-    i0 = np.floor(pos).astype(np.int64) % pat_np.size
-    i1 = (i0 + 1) % pat_np.size
-    t = pos - np.floor(pos)
-    out = -((1.0 - t) * pat_np[i0] + t * pat_np[i1])
-    return np.ascontiguousarray(out, dtype=np.float64)
+    theta = np.arange(n_angles, dtype=np.float64) * (360.0 / n_angles)
+    gains_db = sample.evaluate_radiation_pattern_db(theta)
+    return np.ascontiguousarray(-gains_db, dtype=np.float64)
 
 
 def _build_pixel_initial_loss_map(sample: RadarSample) -> np.ndarray:
-    """
-    Per-pixel directional initial term from antenna pattern using the same
-    angle convention as featurizer-side antenna gain indexing.
-    """
-    H = int(sample.H)
-    W = int(sample.W)
-    pat = getattr(sample, "radiation_pattern", None)
-    if pat is None:
-        return np.zeros((H, W), dtype=np.float64)
-    if isinstance(pat, torch.Tensor):
-        pat_np = pat.detach().cpu().numpy()
-    else:
-        pat_np = np.asarray(pat)
-    pat_np = np.asarray(pat_np, dtype=np.float64).reshape(-1)
-    if pat_np.size == 0:
-        return np.zeros((H, W), dtype=np.float64)
-    if pat_np.size == 1:
-        return np.full((H, W), float(pat_np[0]), dtype=np.float64)
-
-    yy, xx = np.meshgrid(np.arange(H, dtype=np.float64), np.arange(W, dtype=np.float64), indexing="ij")
+    H, W = int(sample.H), int(sample.W)
+    yy, xx = np.meshgrid(np.arange(H, dtype=np.float64),
+                         np.arange(W, dtype=np.float64), indexing="ij")
     theta = np.degrees(np.arctan2(yy - sample.y_ant, xx - sample.x_ant)) % 360.0
-    pos = theta * (float(pat_np.size) / 360.0)
-    i0 = np.floor(pos).astype(np.int64) % pat_np.size
-    i1 = (i0 + 1) % pat_np.size
-    t = pos - np.floor(pos)
-    out = -((1.0 - t) * pat_np[i0] + t * pat_np[i1])
-    return np.ascontiguousarray(out, dtype=np.float64)
+    gains_db = sample.evaluate_radiation_pattern_db(theta.ravel())
+    return np.ascontiguousarray(-gains_db.reshape(H, W), dtype=np.float64)
 
 
 def _normals_from_sample(sample, ref=None, trans=None):

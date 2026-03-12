@@ -15,7 +15,7 @@ import datetime
 from approx import Approx
 from models import RadarSample
 from room_generator import generate_floor_scene
-from antenna_pattern import RadiationPatternConfig, generate_radiation_pattern
+from antenna_pattern import RadiationPatternConfig, generate_radiation_pattern, evaluate_pattern_function_db
 
 
 
@@ -123,7 +123,12 @@ def build_sample_from_generated(
 	cfg = pattern_cfg if pattern_cfg is not None else RadiationPatternConfig()
 	pattern_rng = np.random.default_rng(pattern_seed)
 	pattern_sample = generate_radiation_pattern(pattern_rng, cfg)
-	radiation_pattern = torch.from_numpy(pattern_sample.losses_db.copy())
+
+	# Canonical: evaluate the function on the export grid to produce the compatibility array.
+	export_grid = np.arange(360, dtype=np.float64)
+	canonical_gains = evaluate_pattern_function_db(pattern_sample.function_info, export_grid)
+	radiation_pattern = torch.from_numpy(canonical_gains.astype(np.float32))
+
 	scene["antenna_pattern"] = {
 		"is_isotropic": bool(pattern_sample.is_isotropic),
 		"azimuth_deg": float(pattern_sample.azimuth_deg),
@@ -132,6 +137,7 @@ def build_sample_from_generated(
 		"style": str(pattern_sample.style),
 		"complexity_dim": int(pattern_sample.complexity_dim),
 		"units": "db_gain_negative_pathloss",
+		"pattern_function": pattern_sample.function_info,
 	}
 
 	return RadarSample(
@@ -149,6 +155,7 @@ def build_sample_from_generated(
 		pixel_size=0.25,
 		mask=torch.from_numpy(mask.astype(np.float32)),
 		normals=normals,
+		radiation_pattern_fn_info=pattern_sample.function_info,
 	)
 
 
@@ -188,6 +195,7 @@ def _export_one(sample, mask, normals, refl, trans, scene, gidx, pred_t, samples
 			'pattern_model': str(ant_pattern.get('model', 'latent_fourier')),
 			'pattern_style': str(ant_pattern.get('style', 'unknown')),
 			'pattern_complexity_dim': int(ant_pattern.get('complexity_dim', 0)),
+			'pattern_function': ant_pattern.get('pattern_function'),
 		},
 		'frequency_mhz': int(scene.get('frequency_mhz', 1800)),
 		'canvas': {'width_m': float(canvas.get('width_m', 0.0)), 'height_m': float(canvas.get('height_m', 0.0))},
@@ -212,7 +220,6 @@ def main():
 	parser.add_argument('--freq_min', type=int, default=400, help='Minimum frequency in MHz for uniform sampling')
 	parser.add_argument('--freq_max', type=int, default=10_000, help='Maximum frequency in MHz for uniform sampling')
 	parser.add_argument('--ant_iso_prob', type=float, default=0.25, help='Probability of isotropic antenna pattern')
-	parser.add_argument('--ant_pattern_model', type=str, default='random', choices=['random', 'latent_fourier', 'gaussian_lobes'], help='Pattern generator model (random chooses per sample)')
 	parser.add_argument('--ant_latent_dim_min', type=int, default=8, help='Minimum latent dimension d (uniformly sampled per sample)')
 	parser.add_argument('--ant_latent_dim_max', type=int, default=20, help='Maximum latent dimension d (uniformly sampled per sample)')
 	parser.add_argument('--ant_fourier_order_min', type=int, default=10, help='Minimum Fourier harmonics K (uniform per sample)')
@@ -220,12 +227,6 @@ def main():
 	parser.add_argument('--ant_petal_order_min', type=int, default=3, help='Minimum petal count for petal style')
 	parser.add_argument('--ant_petal_order_max', type=int, default=12, help='Maximum petal count for petal style')
 	parser.add_argument('--ant_db_max', type=float, default=40.0, help='Maximum dB loss in radiation pattern')
-	parser.add_argument('--ant_lobes_min', type=int, default=2, help='Minimum number of directional lobes for non-isotropic patterns')
-	parser.add_argument('--ant_lobes_max', type=int, default=12, help='Maximum number of directional lobes for non-isotropic patterns')
-	parser.add_argument('--ant_lobe_width_deg_min', type=float, default=18.0, help='Minimum lobe width (degrees)')
-	parser.add_argument('--ant_lobe_width_deg_max', type=float, default=80.0, help='Maximum lobe width (degrees)')
-	parser.add_argument('--ant_smooth_sigma_deg_min', type=float, default=2.0, help='Minimum circular smoothing sigma (degrees)')
-	parser.add_argument('--ant_smooth_sigma_deg_max', type=float, default=8.0, help='Maximum circular smoothing sigma (degrees)')
 	parser.add_argument('--ant_symmetry_mode', type=str, default='random', choices=['random', 'none', 'x', 'y', 'xy'], help='Symmetry mode; random samples uniformly among none/x/y/xy')
 	parser.add_argument('--verbose', action='store_true', help='Enable detailed per-step timing logs (DEBUG level)')
 	args = parser.parse_args()
@@ -270,7 +271,6 @@ def main():
 	except Exception:
 		pass
 	pattern_cfg = RadiationPatternConfig(
-		pattern_model=str(args.ant_pattern_model),
 			latent_dim_min=int(args.ant_latent_dim_min),
 			latent_dim_max=int(args.ant_latent_dim_max),
 			fourier_order_min=int(args.ant_fourier_order_min),
@@ -279,19 +279,11 @@ def main():
 			petal_order_max=int(args.ant_petal_order_max),
 			isotropic_probability=float(args.ant_iso_prob),
 			max_loss_db=float(args.ant_db_max),
-		lobe_count_min=int(args.ant_lobes_min),
-		lobe_count_max=int(args.ant_lobes_max),
-		lobe_width_deg_min=float(args.ant_lobe_width_deg_min),
-			lobe_width_deg_max=float(args.ant_lobe_width_deg_max),
-			smooth_sigma_deg_min=float(args.ant_smooth_sigma_deg_min),
-			smooth_sigma_deg_max=float(args.ant_smooth_sigma_deg_max),
 			symmetry_mode=str(args.ant_symmetry_mode),
 		)
 	logging.info(
-		"Antenna pattern config: model=%s d=[%d,%d] K=[%d,%d] p_iso=%.3f db_max=%.2f "
-		"(effective per-sample max is uniform in [0, db_max]) petals=[%d,%d] lobes=[%d,%d] width_deg=[%.1f, %.1f] "
-		"smooth_sigma_deg=[%.1f, %.1f] symmetry=%s",
-		pattern_cfg.pattern_model,
+		"Antenna pattern config: d=[%d,%d] K=[%d,%d] p_iso=%.3f db_max=%.2f "
+		"(effective per-sample max is uniform in [0, db_max]) petals=[%d,%d] symmetry=%s",
 		pattern_cfg.latent_dim_min,
 		pattern_cfg.latent_dim_max,
 		pattern_cfg.fourier_order_min,
@@ -300,12 +292,6 @@ def main():
 		pattern_cfg.max_loss_db,
 		pattern_cfg.petal_order_min,
 		pattern_cfg.petal_order_max,
-		pattern_cfg.lobe_count_min,
-		pattern_cfg.lobe_count_max,
-		pattern_cfg.lobe_width_deg_min,
-		pattern_cfg.lobe_width_deg_max,
-		pattern_cfg.smooth_sigma_deg_min,
-		pattern_cfg.smooth_sigma_deg_max,
 		pattern_cfg.symmetry_mode,
 	)
 

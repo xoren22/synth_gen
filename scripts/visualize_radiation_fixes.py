@@ -56,10 +56,8 @@ def output_map(sample, engine):
 
 def generate_samples(n_samples=6, seed_base=1000):
     pattern_cfg = RadiationPatternConfig(
-        num_angles=360,
         isotropic_probability=0.0,
         max_loss_db=20.0,
-        pattern_model="latent_fourier",
         latent_dim_min=5,
         latent_dim_max=12,
     )

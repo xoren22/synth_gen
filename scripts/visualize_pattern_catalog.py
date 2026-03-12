@@ -4,7 +4,7 @@
 This script generates multiple figures:
   1) latent_fourier styles overview
   2) latent_fourier petal-order sweep
-  3) gaussian_lobes control sweeps
+  3) latent_fourier per-style sweeps (front_back, bidirectional, ripple)
 
 The plots use polar coordinates and show "relative strength":
   strength = max_loss_db - directional_loss_db
@@ -30,10 +30,8 @@ from antenna_pattern import RadiationPatternConfig, generate_radiation_pattern
 
 
 BASE_LATENT_CFG = RadiationPatternConfig(
-    num_angles=360,
     isotropic_probability=0.0,
     max_loss_db=20.0,
-    pattern_model="latent_fourier",
     latent_dim_min=10,
     latent_dim_max=10,
     fourier_order_min=14,
@@ -41,20 +39,6 @@ BASE_LATENT_CFG = RadiationPatternConfig(
     style_mode="random",
     petal_order_min=3,
     petal_order_max=8,
-    symmetry_mode="none",
-)
-
-BASE_GAUSS_CFG = RadiationPatternConfig(
-    num_angles=360,
-    isotropic_probability=0.0,
-    max_loss_db=20.0,
-    pattern_model="gaussian_lobes",
-    lobe_count_min=2,
-    lobe_count_max=6,
-    lobe_width_deg_min=18.0,
-    lobe_width_deg_max=80.0,
-    smooth_sigma_deg_min=2.0,
-    smooth_sigma_deg_max=8.0,
     symmetry_mode="none",
 )
 
@@ -149,43 +133,33 @@ def _latent_style_overview(out_dir: str, seed: int, dpi: int):
     return out_path
 
 
-def _latent_petal_sweep(out_dir: str, seed: int, dpi: int):
-    variants = [
-        ("petal 3..4", dict(petal_order_min=3, petal_order_max=4)),
-        ("petal 5..6", dict(petal_order_min=5, petal_order_max=6)),
-        ("petal 8..10", dict(petal_order_min=8, petal_order_max=10)),
-        ("petal 12..14", dict(petal_order_min=12, petal_order_max=14)),
-    ]
-
+def _latent_deep_dive(
+    style: str,
+    col_variants: list[tuple[str, dict]],
+    row_overrides: list[dict],
+    row_labels: list[str],
+    title: str,
+    filename: str,
+    out_dir: str,
+    seed: int,
+    dpi: int,
+    seed_offset: int = 5000,
+):
     fig, axes = plt.subplots(
-        nrows=2,
-        ncols=len(variants),
-        figsize=(14.6, 7.6),
+        nrows=len(row_overrides),
+        ncols=len(col_variants),
+        figsize=(14.6, 3.8 * len(row_overrides)),
         subplot_kw={"projection": "polar"},
         constrained_layout=True,
     )
+    if len(row_overrides) == 1:
+        axes = axes[np.newaxis, :]
     max_loss = float(BASE_LATENT_CFG.max_loss_db)
 
-    row_overrides = [
-        dict(
-            fourier_order_min=14,
-            fourier_order_max=14,
-            latent_dim_min=10,
-            latent_dim_max=10,
-        ),
-        dict(
-            fourier_order_min=26,
-            fourier_order_max=26,
-            latent_dim_min=20,
-            latent_dim_max=20,
-        ),
-    ]
-    row_labels = ["moderate complexity", "high complexity"]
-
-    for r, row_cfg_overrides in enumerate(row_overrides):
-        for c, (label, petal_cfg) in enumerate(variants):
-            cfg = _latent_style_cfg("petal", **row_cfg_overrides, **petal_cfg)
-            sample = _sample_pattern(cfg, seed + 5000 + 1000 * r + 31 * c)
+    for r, row_cfg in enumerate(row_overrides):
+        for c, (label, col_cfg) in enumerate(col_variants):
+            cfg = _latent_style_cfg(style, **row_cfg, **col_cfg)
+            sample = _sample_pattern(cfg, seed + seed_offset + 1000 * r + 31 * c)
             ax = axes[r, c]
             _plot_pattern(ax, sample, max_loss_db=max_loss)
             if r == 0:
@@ -203,58 +177,106 @@ def _latent_petal_sweep(out_dir: str, seed: int, dpi: int):
                     color="#111111",
                 )
 
-    fig.suptitle("latent_fourier petal sweep (petal_order and global complexity)", fontsize=13)
-    out_path = os.path.join(out_dir, "pattern_catalog_latent_petal_sweep.png")
+    fig.suptitle(title, fontsize=13)
+    out_path = os.path.join(out_dir, filename)
     fig.savefig(out_path, dpi=dpi)
     plt.close(fig)
     return out_path
 
 
-def _gaussian_control_sweep(out_dir: str, seed: int, dpi: int):
-    variants = [
-        ("few + wide + smooth", dict(lobe_count_min=2, lobe_count_max=2, lobe_width_deg_min=55.0, lobe_width_deg_max=80.0, smooth_sigma_deg_min=8.0, smooth_sigma_deg_max=10.0)),
-        ("few + narrow + sharp", dict(lobe_count_min=2, lobe_count_max=2, lobe_width_deg_min=8.0, lobe_width_deg_max=16.0, smooth_sigma_deg_min=0.0, smooth_sigma_deg_max=0.0)),
-        ("many + narrow + sharp", dict(lobe_count_min=8, lobe_count_max=8, lobe_width_deg_min=6.0, lobe_width_deg_max=12.0, smooth_sigma_deg_min=0.0, smooth_sigma_deg_max=1.0)),
-        ("many + wide + smooth", dict(lobe_count_min=8, lobe_count_max=8, lobe_width_deg_min=30.0, lobe_width_deg_max=70.0, smooth_sigma_deg_min=6.0, smooth_sigma_deg_max=12.0)),
-    ]
-
-    sym_rows = [("none", "symmetry none"), ("xy", "symmetry xy")]
-
-    fig, axes = plt.subplots(
-        nrows=len(sym_rows),
-        ncols=len(variants),
-        figsize=(15.0, 8.1),
-        subplot_kw={"projection": "polar"},
-        constrained_layout=True,
+def _latent_petal_sweep(out_dir: str, seed: int, dpi: int):
+    return _latent_deep_dive(
+        style="petal",
+        col_variants=[
+            ("petal 3..4", dict(petal_order_min=3, petal_order_max=4)),
+            ("petal 5..6", dict(petal_order_min=5, petal_order_max=6)),
+            ("petal 8..10", dict(petal_order_min=8, petal_order_max=10)),
+            ("petal 12..14", dict(petal_order_min=12, petal_order_max=14)),
+        ],
+        row_overrides=[
+            dict(fourier_order_min=14, fourier_order_max=14, latent_dim_min=10, latent_dim_max=10),
+            dict(fourier_order_min=26, fourier_order_max=26, latent_dim_min=20, latent_dim_max=20),
+        ],
+        row_labels=["moderate complexity", "high complexity"],
+        title="latent_fourier petal sweep (petal_order and global complexity)",
+        filename="pattern_catalog_latent_petal_sweep.png",
+        out_dir=out_dir,
+        seed=seed,
+        dpi=dpi,
+        seed_offset=5000,
     )
-    max_loss = float(BASE_GAUSS_CFG.max_loss_db)
 
-    for r, (sym, row_label) in enumerate(sym_rows):
-        for c, (label, variant_cfg) in enumerate(variants):
-            cfg = replace(BASE_GAUSS_CFG, symmetry_mode=sym, **variant_cfg)
-            sample = _sample_pattern(cfg, seed + 9000 + 1000 * r + 23 * c)
-            ax = axes[r, c]
-            _plot_pattern(ax, sample, max_loss_db=max_loss)
-            if r == 0:
-                ax.set_title(label, fontsize=10, pad=14)
-            if c == 0:
-                ax.text(
-                    -0.35,
-                    0.5,
-                    row_label,
-                    transform=ax.transAxes,
-                    rotation=90,
-                    va="center",
-                    ha="center",
-                    fontsize=9,
-                    color="#111111",
-                )
 
-    fig.suptitle("gaussian_lobes controls (count, width, smoothing, symmetry)", fontsize=13)
-    out_path = os.path.join(out_dir, "pattern_catalog_gaussian_lobes.png")
-    fig.savefig(out_path, dpi=dpi)
-    plt.close(fig)
-    return out_path
+def _latent_front_back_sweep(out_dir: str, seed: int, dpi: int):
+    return _latent_deep_dive(
+        style="front_back",
+        col_variants=[
+            ("K=6", dict(fourier_order_min=6, fourier_order_max=6)),
+            ("K=14", dict(fourier_order_min=14, fourier_order_max=14)),
+            ("K=24", dict(fourier_order_min=24, fourier_order_max=24)),
+            ("K=36", dict(fourier_order_min=36, fourier_order_max=36)),
+        ],
+        row_overrides=[
+            dict(latent_dim_min=6, latent_dim_max=6, symmetry_mode="none"),
+            dict(latent_dim_min=6, latent_dim_max=6, symmetry_mode="x"),
+            dict(latent_dim_min=20, latent_dim_max=20, symmetry_mode="none"),
+        ],
+        row_labels=["d=6, no symmetry", "d=6, sym x", "d=20, no symmetry"],
+        title="latent_fourier front_back sweep (Fourier order K, latent dim, symmetry)",
+        filename="pattern_catalog_latent_front_back_sweep.png",
+        out_dir=out_dir,
+        seed=seed,
+        dpi=dpi,
+        seed_offset=6000,
+    )
+
+
+def _latent_bidirectional_sweep(out_dir: str, seed: int, dpi: int):
+    return _latent_deep_dive(
+        style="bidirectional",
+        col_variants=[
+            ("K=6", dict(fourier_order_min=6, fourier_order_max=6)),
+            ("K=14", dict(fourier_order_min=14, fourier_order_max=14)),
+            ("K=24", dict(fourier_order_min=24, fourier_order_max=24)),
+            ("K=36", dict(fourier_order_min=36, fourier_order_max=36)),
+        ],
+        row_overrides=[
+            dict(latent_dim_min=6, latent_dim_max=6, symmetry_mode="none"),
+            dict(latent_dim_min=6, latent_dim_max=6, symmetry_mode="xy"),
+            dict(latent_dim_min=20, latent_dim_max=20, symmetry_mode="none"),
+        ],
+        row_labels=["d=6, no symmetry", "d=6, sym xy", "d=20, no symmetry"],
+        title="latent_fourier bidirectional sweep (Fourier order K, latent dim, symmetry)",
+        filename="pattern_catalog_latent_bidirectional_sweep.png",
+        out_dir=out_dir,
+        seed=seed,
+        dpi=dpi,
+        seed_offset=7000,
+    )
+
+
+def _latent_ripple_sweep(out_dir: str, seed: int, dpi: int):
+    return _latent_deep_dive(
+        style="ripple",
+        col_variants=[
+            ("K=6", dict(fourier_order_min=6, fourier_order_max=6)),
+            ("K=14", dict(fourier_order_min=14, fourier_order_max=14)),
+            ("K=24", dict(fourier_order_min=24, fourier_order_max=24)),
+            ("K=36", dict(fourier_order_min=36, fourier_order_max=36)),
+        ],
+        row_overrides=[
+            dict(latent_dim_min=6, latent_dim_max=6, symmetry_mode="none"),
+            dict(latent_dim_min=6, latent_dim_max=6, symmetry_mode="x"),
+            dict(latent_dim_min=20, latent_dim_max=20, symmetry_mode="none"),
+        ],
+        row_labels=["d=6, no symmetry", "d=6, sym x", "d=20, no symmetry"],
+        title="latent_fourier ripple sweep (Fourier order K, latent dim, symmetry)",
+        filename="pattern_catalog_latent_ripple_sweep.png",
+        out_dir=out_dir,
+        seed=seed,
+        dpi=dpi,
+        seed_offset=8000,
+    )
 
 
 def main():
@@ -274,7 +296,9 @@ def main():
     outputs = [
         _latent_style_overview(out_dir, seed=args.seed, dpi=int(args.dpi)),
         _latent_petal_sweep(out_dir, seed=args.seed, dpi=int(args.dpi)),
-        _gaussian_control_sweep(out_dir, seed=args.seed, dpi=int(args.dpi)),
+        _latent_front_back_sweep(out_dir, seed=args.seed, dpi=int(args.dpi)),
+        _latent_bidirectional_sweep(out_dir, seed=args.seed, dpi=int(args.dpi)),
+        _latent_ripple_sweep(out_dir, seed=args.seed, dpi=int(args.dpi)),
     ]
 
     print("Generated pattern catalog:")

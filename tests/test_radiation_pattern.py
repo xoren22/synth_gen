@@ -6,7 +6,6 @@ Covers:
   C. Pixel-ray consistency – pixel map and ray array agree for the same direction
   D. End-to-end – Approx.approximate produces valid output with non-isotropic patterns
   E. latent_dim sampling – sampled uniformly from latent_dim_min..latent_dim_max
-  F. Gaussian complexity_dim – reflects actual sampled lobe count, not lobe_count_max
 """
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -19,7 +18,6 @@ from models import RadarSample
 from antenna_pattern import (
     RadiationPatternConfig,
     generate_radiation_pattern,
-    _generate_gaussian_lobe_pattern,
 )
 from approx import _build_ray_initial_losses, _build_pixel_initial_loss_map
 
@@ -28,9 +26,17 @@ from approx import _build_ray_initial_losses, _build_pixel_initial_loss_map
 # Helpers
 # ---------------------------------------------------------------------------
 
+_ISO_FN_INFO = {
+    "version": 1, "type": "isotropic", "azimuth_deg": 0.0,
+    "symmetry": "none", "max_loss_db": 40.0,
+    "output_units": "db_gain_negative_pathloss",
+}
+
+
 def _make_sample(
     H=64, W=64, x_ant=32.0, y_ant=32.0, freq_MHz=2400.0,
     azimuth=0.0, pattern=None, ref=None, trans=None,
+    fn_info=None,
 ):
     """Build a minimal RadarSample for testing pattern lookup functions."""
     if ref is None:
@@ -39,6 +45,8 @@ def _make_sample(
         trans = torch.zeros(H, W, dtype=torch.float64)
     if pattern is None:
         pattern = torch.zeros(360, dtype=torch.float64)
+    if fn_info is None:
+        fn_info = _ISO_FN_INFO
     return RadarSample(
         H=H, W=W,
         x_ant=x_ant, y_ant=y_ant,
@@ -49,14 +57,13 @@ def _make_sample(
         dist_map=torch.zeros(H, W),
         pathloss=torch.zeros(H, W),
         radiation_pattern=pattern,
+        radiation_pattern_fn_info=fn_info,
     )
 
 
 _NON_ISO_CFG = RadiationPatternConfig(
-    num_angles=360,
     isotropic_probability=0.0,
     max_loss_db=20.0,
-    pattern_model="latent_fourier",
     latent_dim_min=8,
     latent_dim_max=8,
 )
@@ -81,6 +88,7 @@ class TestSignConvention:
         sample = _make_sample(
             pattern=torch.from_numpy(non_iso_pattern.losses_db.astype(np.float64)),
             azimuth=non_iso_pattern.azimuth_deg,
+            fn_info=non_iso_pattern.function_info,
         )
         ray_init = _build_ray_initial_losses(sample, 360)
         assert np.all(ray_init >= 0), f"min={ray_init.min()}"
@@ -89,6 +97,7 @@ class TestSignConvention:
         sample = _make_sample(
             pattern=torch.from_numpy(non_iso_pattern.losses_db.astype(np.float64)),
             azimuth=non_iso_pattern.azimuth_deg,
+            fn_info=non_iso_pattern.function_info,
         )
         pix_init = _build_pixel_initial_loss_map(sample)
         assert np.all(pix_init >= 0), f"min={pix_init.min()}"
@@ -98,6 +107,7 @@ class TestSignConvention:
         sample = _make_sample(
             pattern=torch.from_numpy(non_iso_pattern.losses_db.astype(np.float64)),
             azimuth=non_iso_pattern.azimuth_deg,
+            fn_info=non_iso_pattern.function_info,
         )
         ray_init = _build_ray_initial_losses(sample, 360)
         pat_np = non_iso_pattern.losses_db.astype(np.float64)
@@ -125,24 +135,28 @@ class TestAngleConvention:
         pat2 = generate_radiation_pattern(rng2, _NON_ISO_CFG)
 
         s1 = _make_sample(pattern=torch.from_numpy(pat1.losses_db.astype(np.float64)),
-                          azimuth=pat1.azimuth_deg)
+                          azimuth=pat1.azimuth_deg, fn_info=pat1.function_info)
         s2 = _make_sample(pattern=torch.from_numpy(pat2.losses_db.astype(np.float64)),
-                          azimuth=pat2.azimuth_deg)
+                          azimuth=pat2.azimuth_deg, fn_info=pat2.function_info)
 
         ray1 = _build_ray_initial_losses(s1, 360)
         ray2 = _build_ray_initial_losses(s2, 360)
         np.testing.assert_array_almost_equal(ray1, ray2)
 
     def test_ray_peak_aligns_with_pattern_peak(self, non_iso_pattern):
-        """Minimum ray loss should be at the same angle as the pattern's max gain."""
+        """Minimum ray loss should be near the function evaluation's max gain."""
+        from antenna_pattern import evaluate_pattern_function_db
         sample = _make_sample(
             pattern=torch.from_numpy(non_iso_pattern.losses_db.astype(np.float64)),
             azimuth=non_iso_pattern.azimuth_deg,
+            fn_info=non_iso_pattern.function_info,
         )
         ray_init = _build_ray_initial_losses(sample, 360)
-        pat_np = non_iso_pattern.losses_db.astype(np.float64)
-
-        pattern_peak_idx = int(np.argmax(pat_np))
+        # Compare against the function evaluation, not the float32 stored array,
+        # to avoid degenerate-peak tie-breaking differences.
+        angles = np.arange(360, dtype=np.float64)
+        fn_gains = evaluate_pattern_function_db(non_iso_pattern.function_info, angles)
+        pattern_peak_idx = int(np.argmax(fn_gains))
         ray_min_idx = int(np.argmin(ray_init))
         diff = abs(pattern_peak_idx - ray_min_idx) % 360
         diff = min(diff, 360 - diff)
@@ -150,23 +164,23 @@ class TestAngleConvention:
 
     def test_different_azimuth_rotates_pixel_map(self):
         """Two patterns with different azimuths should produce rotated pixel maps."""
-        # Manually create two identical gain arrays but attribute different azimuths
-        # Since lookup doesn't use azimuth, shifting the array itself is what matters.
         rng = np.random.default_rng(55)
         pat = generate_radiation_pattern(rng, _NON_ISO_CFG)
-        gains = pat.losses_db.astype(np.float64)
 
-        # Rotate gains by 90 indices (= 90 degrees for 360-length)
-        gains_rotated = np.roll(gains, 90)
+        # Use a second pattern with different azimuth
+        rng2 = np.random.default_rng(77)
+        pat2 = generate_radiation_pattern(rng2, _NON_ISO_CFG)
 
-        s1 = _make_sample(pattern=torch.from_numpy(gains))
-        s2 = _make_sample(pattern=torch.from_numpy(gains_rotated))
+        s1 = _make_sample(pattern=torch.from_numpy(pat.losses_db.astype(np.float64)),
+                          fn_info=pat.function_info)
+        s2 = _make_sample(pattern=torch.from_numpy(pat2.losses_db.astype(np.float64)),
+                          fn_info=pat2.function_info)
 
         pix1 = _build_pixel_initial_loss_map(s1)
         pix2 = _build_pixel_initial_loss_map(s2)
 
         # They should differ
-        assert not np.allclose(pix1, pix2), "Rotated pattern should give different pixel map"
+        assert not np.allclose(pix1, pix2), "Different patterns should give different pixel map"
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +195,7 @@ class TestPixelRayConsistency:
             H=H, W=W, x_ant=64.0, y_ant=64.0,
             pattern=torch.from_numpy(non_iso_pattern.losses_db.astype(np.float64)),
             azimuth=non_iso_pattern.azimuth_deg,
+            fn_info=non_iso_pattern.function_info,
         )
         ray_init = _build_ray_initial_losses(sample, 360)
         pix_init = _build_pixel_initial_loss_map(sample)
@@ -195,6 +210,7 @@ class TestPixelRayConsistency:
             H=H, W=W, x_ant=64.0, y_ant=64.0,
             pattern=torch.from_numpy(non_iso_pattern.losses_db.astype(np.float64)),
             azimuth=non_iso_pattern.azimuth_deg,
+            fn_info=non_iso_pattern.function_info,
         )
         ray_init = _build_ray_initial_losses(sample, 360)
         pix_init = _build_pixel_initial_loss_map(sample)
@@ -209,6 +225,7 @@ class TestPixelRayConsistency:
             H=H, W=W, x_ant=64.0, y_ant=64.0,
             pattern=torch.from_numpy(non_iso_pattern.losses_db.astype(np.float64)),
             azimuth=non_iso_pattern.azimuth_deg,
+            fn_info=non_iso_pattern.function_info,
         )
         ray_init = _build_ray_initial_losses(sample, 360)
         pix_init = _build_pixel_initial_loss_map(sample)
@@ -223,6 +240,7 @@ class TestPixelRayConsistency:
             H=H, W=W, x_ant=64.0, y_ant=64.0,
             pattern=torch.from_numpy(non_iso_pattern.losses_db.astype(np.float64)),
             azimuth=non_iso_pattern.azimuth_deg,
+            fn_info=non_iso_pattern.function_info,
         )
         ray_init = _build_ray_initial_losses(sample, 360)
         pix_init = _build_pixel_initial_loss_map(sample)
@@ -250,6 +268,7 @@ class TestEndToEnd:
             pattern=torch.from_numpy(non_iso_pattern.losses_db.astype(np.float64)),
             azimuth=non_iso_pattern.azimuth_deg,
             ref=ref, trans=trans,
+            fn_info=non_iso_pattern.function_info,
         )
 
         result = Approx(method='combined').approximate(sample, max_trans=3, max_refl=2)
@@ -274,6 +293,7 @@ class TestEndToEnd:
             pattern=torch.from_numpy(pat.losses_db.astype(np.float64)),
             azimuth=pat.azimuth_deg,
             ref=ref, trans=trans,
+            fn_info=pat.function_info,
         )
         sample_iso = _make_sample(
             H=H, W=W, x_ant=16.0, y_ant=16.0,
@@ -298,7 +318,7 @@ class TestLatentDim:
         """When latent_dim_min == latent_dim_max, complexity_dim is that fixed value."""
         cfg = RadiationPatternConfig(
             isotropic_probability=0.0,
-            pattern_model="latent_fourier",
+        
             latent_dim_min=10,
             latent_dim_max=10,
         )
@@ -310,7 +330,7 @@ class TestLatentDim:
         """When latent_dim_min != latent_dim_max, sample from [min, max]."""
         cfg = RadiationPatternConfig(
             isotropic_probability=0.0,
-            pattern_model="latent_fourier",
+        
             latent_dim_min=4,
             latent_dim_max=8,
         )
@@ -323,56 +343,3 @@ class TestLatentDim:
         assert len(dims) > 1, f"Should sample different dims, got {dims}"
 
 
-# ---------------------------------------------------------------------------
-# Test F: Gaussian complexity_dim
-# ---------------------------------------------------------------------------
-
-class TestGaussianComplexityDim:
-    def test_reflects_actual_lobe_count(self):
-        """complexity_dim should vary with actual sampled n_lobes, not always be lobe_count_max."""
-        cfg = RadiationPatternConfig(
-            isotropic_probability=0.0,
-            pattern_model="gaussian_lobes",
-            lobe_count_min=2,
-            lobe_count_max=6,
-        )
-        dims = set()
-        for seed in range(50):
-            rng = np.random.default_rng(seed)
-            pat = generate_radiation_pattern(rng, cfg)
-            assert 2 <= pat.complexity_dim <= 6
-            dims.add(pat.complexity_dim)
-        assert dims != {6}, f"Should not always be lobe_count_max, got {dims}"
-        assert len(dims) > 1, f"Should have variable complexity_dim, got {dims}"
-
-    def test_internal_return_value(self):
-        """_generate_gaussian_lobe_pattern returns (gains, style, n_lobes) 3-tuple."""
-        cfg = RadiationPatternConfig(lobe_count_min=3, lobe_count_max=5)
-        rng = np.random.default_rng(7)
-        result = _generate_gaussian_lobe_pattern(rng, cfg, azimuth_deg=45.0, symmetry="none")
-        assert len(result) == 3, f"Expected 3-tuple, got {len(result)}-tuple"
-        gains, style, n_lobes = result
-        assert style == "gaussian_lobes"
-        assert 3 <= n_lobes <= 5
-
-
-# ---------------------------------------------------------------------------
-# Test G: num_angles contract
-# ---------------------------------------------------------------------------
-
-class TestNumAngles:
-    def test_num_angles_respected_exactly(self):
-        cfg = RadiationPatternConfig(
-            num_angles=7,
-            isotropic_probability=1.0,
-        )
-        pat = generate_radiation_pattern(np.random.default_rng(0), cfg)
-        assert pat.losses_db.shape == (7,)
-
-    def test_num_angles_must_be_positive(self):
-        cfg = RadiationPatternConfig(
-            num_angles=0,
-            isotropic_probability=1.0,
-        )
-        with pytest.raises(ValueError, match="num_angles must be >= 1"):
-            generate_radiation_pattern(np.random.default_rng(0), cfg)
