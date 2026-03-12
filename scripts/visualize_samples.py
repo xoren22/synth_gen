@@ -36,36 +36,24 @@ def _decode_meta_json_from_npz(data):
         return None
 
 
-def load_sample(sample_dir):
-    """Load arrays and metadata from a sample directory.
+def load_sample(npz_path):
+    """Load arrays and metadata from an NPZ file path.
 
-    Supports both formats:
-    - New: metadata embedded under npz key 'meta_json'
-    - Old: sidecar *.json file alongside *.npz
+    Metadata is read from the embedded 'meta_json' key.
     """
-    npz_files = [f for f in os.listdir(sample_dir) if f.endswith(".npz")]
-    if not npz_files:
-        return None, None
-
-    data = np.load(os.path.join(sample_dir, npz_files[0]))
+    data = np.load(npz_path)
     meta = _decode_meta_json_from_npz(data)
-    if meta is None:
-        json_files = [f for f in os.listdir(sample_dir) if f.endswith(".json")]
-        if not json_files:
-            return None, None
-        with open(os.path.join(sample_dir, json_files[0])) as f:
-            meta = json.load(f)
     return data, meta
 
 
-def plot_samples(run_dir, sample_dirs, out_path):
+def plot_samples(run_dir, npz_paths, out_path):
     """Create a figure with subplots for each sample showing pathloss, mask, and info."""
-    n = len(sample_dirs)
+    n = len(npz_paths)
     fig, axes = plt.subplots(n, 3, figsize=(18, 5 * n), squeeze=False)
     fig.suptitle(f"Synthetic Samples from: {os.path.basename(run_dir)}", fontsize=14, y=1.0)
 
-    for i, sdir in enumerate(sample_dirs):
-        data, meta = load_sample(os.path.join(run_dir, sdir))
+    for i, npz_path in enumerate(npz_paths):
+        data, meta = load_sample(npz_path)
         if data is None:
             for j in range(3):
                 axes[i, j].text(0.5, 0.5, "Failed to load", ha="center", va="center")
@@ -89,7 +77,7 @@ def plot_samples(run_dir, sample_dirs, out_path):
         pl_display[pl_display >= 32000] = np.nan
         im = ax.imshow(pl_display, cmap="inferno_r", interpolation="nearest")
         ax.plot(ant_x, ant_y, "c+", markersize=10, markeredgewidth=2)
-        ax.set_title(f"Pathloss  [{sdir}]", fontsize=10)
+        ax.set_title(f"Pathloss  [{meta.get('sample_name', '')}]", fontsize=10)
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="dB")
 
         # --- Mask + transmittance overlay ---
@@ -100,13 +88,13 @@ def plot_samples(run_dir, sample_dirs, out_path):
         rgb[..., 2] = (transmittance > 0).astype(np.float32) * 0.3
         ax.imshow(rgb, interpolation="nearest")
         ax.plot(ant_x, ant_y, "c+", markersize=10, markeredgewidth=2)
-        ax.set_title(f"Mask + Walls  [{sdir}]", fontsize=10)
+        ax.set_title(f"Mask + Walls  [{meta.get('sample_name', '')}]", fontsize=10)
 
         # --- Info text panel ---
         ax = axes[i, 2]
         ax.set_axis_off()
         info_lines = [
-            f"Sample: {meta.get('sample_name', sdir)}",
+            f"Sample: {meta.get('sample_name', '')}",
             f"Shape: {hw[0]} x {hw[1]} px",
             f"Pixel size: {pix} m",
             f"Canvas: {canvas.get('width_m', 0):.1f} x {canvas.get('height_m', 0):.1f} m",
@@ -143,21 +131,25 @@ def main():
         print(f"Error: {run_dir} is not a directory", file=sys.stderr)
         sys.exit(1)
 
-    all_samples = sorted([
-        d for d in os.listdir(run_dir)
-        if os.path.isdir(os.path.join(run_dir, d))
-        and any(f.endswith(".npz") for f in os.listdir(os.path.join(run_dir, d)))
-    ])
+    # Collect all NPZ paths from bucket subdirectories
+    all_npz = []
+    for bucket in sorted(os.listdir(run_dir)):
+        bucket_path = os.path.join(run_dir, bucket)
+        if not os.path.isdir(bucket_path):
+            continue
+        for f in sorted(os.listdir(bucket_path)):
+            if f.startswith("s") and f.endswith(".npz"):
+                all_npz.append(os.path.join(bucket_path, f))
 
-    if not all_samples:
-        print("No sample directories found.", file=sys.stderr)
+    if not all_npz:
+        print("No sample NPZ files found.", file=sys.stderr)
         sys.exit(1)
 
     random.seed(args.seed)
-    chosen = random.sample(all_samples, min(args.n, len(all_samples)))
+    chosen = random.sample(all_npz, min(args.n, len(all_npz)))
     chosen.sort()
 
-    print(f"Found {len(all_samples)} samples, visualizing {len(chosen)}: {chosen}")
+    print(f"Found {len(all_npz)} samples, visualizing {len(chosen)}")
 
     out_path = args.out or os.path.join(run_dir, "samples_overview.png")
     plot_samples(run_dir, chosen, out_path)

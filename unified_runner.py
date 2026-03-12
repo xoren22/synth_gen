@@ -125,15 +125,16 @@ def _count_done(out_dir):
     if not os.path.isdir(out_dir):
         return 0
     n = 0
-    for e in os.scandir(out_dir):
-        if e.is_dir() and e.name.startswith("s"):
-            npz_path = os.path.join(e.path, e.name + ".npz")
-            try:
-                if os.path.isfile(npz_path) and os.path.getsize(npz_path) > 0:
-                    n += 1
-            except OSError:
-                # Ignore transient stat/read errors.
-                pass
+    for bucket in os.scandir(out_dir):
+        if not bucket.is_dir():
+            continue
+        for e in os.scandir(bucket.path):
+            if e.is_file() and e.name.startswith("s") and e.name.endswith(".npz"):
+                try:
+                    if e.stat().st_size > 0:
+                        n += 1
+                except OSError:
+                    pass
     return n
 
 def _parse_iso_utc(ts):

@@ -19,15 +19,25 @@ from antenna_pattern import RadiationPatternConfig, generate_radiation_pattern, 
 
 
 
-def _export_sample_npz_json(out_root: str, sample_name: str, arrays: dict, metadata: dict) -> str:
+SAMPLES_PER_BUCKET = 1000
+
+
+def _bucket_dir(out_root: str, idx: int) -> str:
+	"""Return the bucket subdirectory for sample index *idx* and ensure it exists."""
+	bucket = idx // SAMPLES_PER_BUCKET
+	d = os.path.join(out_root, f"{bucket:06d}")
+	os.makedirs(d, exist_ok=True)
+	return d
+
+
+def _export_sample_npz_json(out_root: str, sample_name: str, idx: int, arrays: dict, metadata: dict) -> str:
 	"""
-	Save arrays and metadata to {out_root}/{sample_name}/{sample_name}.npz (compressed).
+	Save arrays and metadata to {out_root}/{bucket}/{sample_name}.npz (compressed).
 	Metadata is stored under the 'meta_json' key as a JSON string.
 	Returns npz_path.
 	"""
-	sample_dir = os.path.join(out_root, sample_name)
-	os.makedirs(sample_dir, exist_ok=True)
-	npz_path = os.path.join(sample_dir, f"{sample_name}.npz")
+	bucket = _bucket_dir(out_root, idx)
+	npz_path = os.path.join(bucket, f"{sample_name}.npz")
 
 	# Normalize dtypes for compact storage; preserve float16 as-is
 	np_arrays = {}
@@ -75,26 +85,19 @@ def _ensure_unique_run_dir(base_root: str, desired_run_id: str | None) -> tuple[
 
 
 
-def _reserve_sample_dir(samples_dir: str, start_idx: int) -> str:
+def _reserve_sample_name(samples_dir: str, start_idx: int) -> tuple[str, int]:
     """
-    Reserve a unique sample directory by creating it without scanning the
-    whole directory. Avoids os.listdir on huge directories.
-    Returns the created sample name (e.g., 's000123').
+    Reserve a unique sample name by checking that no .npz with that name
+    exists in its bucket yet. Returns (sample_name, idx).
     """
     idx = int(max(0, start_idx))
     while True:
         name = f"s{idx:012d}"
-        path = os.path.join(samples_dir, name)
-        try:
-            os.makedirs(path, exist_ok=False)
-            return name
-        except FileExistsError:
-            idx += 1
-            continue
-        except OSError:
-            # On transient I/O errors, advance and retry without directory listing
-            time.sleep(0.01)
-            idx += 1
+        bucket = _bucket_dir(samples_dir, idx)
+        path = os.path.join(bucket, f"{name}.npz")
+        if not os.path.exists(path):
+            return name, idx
+        idx += 1
 
 
 def build_sample_from_generated(
@@ -170,7 +173,7 @@ def _generate_one(seed_i, freq_min, freq_max):
 def _export_one(sample, mask, normals, refl, trans, scene, gidx, pred_t, samples_dir, pbar=None):
 	"""Export a single predicted sample to disk (shared by threaded and sequential modes)."""
 	pred = pred_t.cpu().numpy() if hasattr(pred_t, 'cpu') else np.array(pred_t)
-	sample_name = _reserve_sample_dir(samples_dir, gidx)
+	sample_name, sample_idx = _reserve_sample_name(samples_dir, gidx)
 	arrays = {
 		'normals': normals.astype(np.float16, copy=False),
 		'reflectance': refl.astype(np.float16, copy=False),
@@ -201,7 +204,7 @@ def _export_one(sample, mask, normals, refl, trans, scene, gidx, pred_t, samples
 		'canvas': {'width_m': float(canvas.get('width_m', 0.0)), 'height_m': float(canvas.get('height_m', 0.0))},
 		'created_at_unix_s': float(time.time()),
 	}
-	_export_sample_npz_json(samples_dir, sample_name, arrays, metadata)
+	_export_sample_npz_json(samples_dir, sample_name, sample_idx, arrays, metadata)
 	if pbar is not None:
 		pbar.update(1)
 
