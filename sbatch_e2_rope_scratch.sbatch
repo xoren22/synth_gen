@@ -4,9 +4,10 @@
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=224
 #SBATCH --mem=500G
-#SBATCH --time=15-00:00:00
+#SBATCH --time=30-00:00:00
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
+#SBATCH --nodelist=gpu06
 
 set -euo pipefail
 

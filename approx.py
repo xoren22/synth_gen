@@ -83,7 +83,7 @@ def _fspl(dist_m: float, freq_MHz: float, min_dist_m: float = 0.125) -> float:
     return 20.0*np.log10(d) + 20.0*np.log10(freq_MHz) - 27.55
 
 # Fast FSPL lookup table to avoid log10 in inner loops
-@njit(cache=False)
+@njit(cache=True)
 def _build_fspl_lut(max_steps: int, pixel_size: float, freq_MHz: float, min_dist_m: float = 0.125):
     lut = np.empty(max_steps + 1, np.float64)
     for k in range(max_steps + 1):
@@ -107,7 +107,7 @@ def _fspl_from_lut(lut: np.ndarray, step_index: int) -> float:
 # ---------------------------------------------------------------------#
 
 
-@njit(parallel=True, cache=False)
+@njit(parallel=True, cache=True)
 def _backfill_direct_los(
     out: np.ndarray,
     cnt: np.ndarray,
@@ -257,7 +257,7 @@ def _reflect_dir(dx, dy, nx, ny):
     mag = np.hypot(rx, ry)
     return (-dx, -dy) if mag==0 else (rx/mag, ry/mag)
 
-@njit(cache=False)
+@njit(cache=True)
 def _trace_ray_recursive(
     refl_mat, trans_mat, nx_img, ny_img,
     out_img, counts,
@@ -363,7 +363,7 @@ def _trace_ray_recursive(
                 )
 
 
-@njit(parallel=True, fastmath=True, nogil=True, boundscheck=False, cache=False)
+@njit(parallel=True, fastmath=True, nogil=True, boundscheck=False, cache=True)
 def calculate_combined_loss_with_normals(
     reflectance_mat, transmittance_mat, nx_img, ny_img,
     x_ant, y_ant, freq_MHz,
