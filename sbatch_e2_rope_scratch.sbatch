@@ -2,7 +2,7 @@
 #SBATCH --job-name=synth_100M
 #SBATCH --gres=gpu:0
 #SBATCH --nodes=1
-#SBATCH --cpus-per-task=180
+#SBATCH --cpus-per-task=224
 #SBATCH --mem=500G
 #SBATCH --time=15-00:00:00
 #SBATCH --output=logs/%x_%j.out

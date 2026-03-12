@@ -27,7 +27,7 @@ log = logging.getLogger("runner")
 META = "meta.json"
 STATE = "runner_state.json"
 CONTROL = "control.json"
-STALE_S = 60
+STALE_S = 300
 POLL_S = 5
 ST_PORT = 8501
 DEFAULT_WORKERS = 5
@@ -291,6 +291,9 @@ def _reap_children():
 def cmd_worker(args):
     os.environ["NUMBA_THREADING_LAYER"] = "tbb"
     os.environ["NUMBA_NUM_THREADS"] = str(args.numba_threads)
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
     root = Path(__file__).resolve().parent.parent
     if str(root) not in sys.path:
@@ -370,6 +373,7 @@ def cmd_worker(args):
         pass
 
     model = Approx()
+    update("running", done)  # heartbeat after JIT warmup
     pattern_cfg = RadiationPatternConfig(
         latent_dim_min=int(args.ant_latent_dim_min),
         latent_dim_max=int(args.ant_latent_dim_max),
