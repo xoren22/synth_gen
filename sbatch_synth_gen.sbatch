@@ -10,6 +10,9 @@
 
 set -euo pipefail
 
+source /home/miniconda3/etc/profile.d/conda.sh
+conda activate indooro
+
 WORK_DIR="/home/xoren/synth_gen"
 
 mkdir -p "${WORK_DIR}/logs"
