@@ -2,12 +2,11 @@
 #SBATCH --job-name=synth_100M
 #SBATCH --gres=gpu:0
 #SBATCH --nodes=1
-#SBATCH --cpus-per-task=224
+#SBATCH --cpus-per-task=180
 #SBATCH --mem=500G
 #SBATCH --time=30-00:00:00
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
-#SBATCH --nodelist=gpu06
 
 set -euo pipefail
 
@@ -27,6 +26,7 @@ ANT_ISO_PROB=0.2          # isotropic probability
 # ============================================
 
 python unified_runner.py start \
+  --data-dir /mnt/weka/xoren/synth_data \
   --workers "$NUM_WORKERS" \
   --num-samples "$NUM_SAMPLES" \
   --ant-iso-prob "$ANT_ISO_PROB"

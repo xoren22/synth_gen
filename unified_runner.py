@@ -537,7 +537,7 @@ def cmd_start(args):
     if args.run_dir:
         rd = os.path.abspath(args.run_dir)
     else:
-        base = _default_runs_base()
+        base = os.path.abspath(args.data_dir) if args.data_dir else _default_runs_base()
         os.makedirs(base, exist_ok=True)
         rd = os.path.join(base, datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S"))
         i = 1
@@ -1019,6 +1019,7 @@ def main():
 
     s = sub.add_parser("start", help="Launch/reattach orchestrator")
     s.add_argument("--run-dir", default=None)
+    s.add_argument("--data-dir", default=None, help="Base directory for runs (default: ./data); each run auto-creates a timestamped subdir")
     s.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
     s.add_argument("--num-samples", type=int, default=DEFAULT_NUM_SAMPLES)
     s.add_argument("--dry-run", action="store_true")
