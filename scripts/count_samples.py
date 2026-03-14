@@ -87,17 +87,19 @@ def main():
         print("No runs found.")
         sys.exit(1)
 
-    # First count
+    # First count (use midpoint time to account for counting duration)
+    ta = time.monotonic()
     _, total1 = count_all(all_runs)
-    t1 = time.monotonic()
+    t1 = (ta + time.monotonic()) / 2
 
-    print("Measuring throughput (10s)...", end="", flush=True)
-    time.sleep(10)
+    print("Measuring throughput (20s)...", end="", flush=True)
+    time.sleep(20)
     print(" done.\n")
 
     # Second count
+    tb = time.monotonic()
     results2, total2 = count_all(all_runs)
-    t2 = time.monotonic()
+    t2 = (tb + time.monotonic()) / 2
     dt = t2 - t1
 
     for info in results2:
