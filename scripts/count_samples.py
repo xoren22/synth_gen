@@ -92,8 +92,8 @@ def main():
     _, total1 = count_all(all_runs)
     t1 = (ta + time.monotonic()) / 2
 
-    print("Measuring throughput (20s)...", end="", flush=True)
-    time.sleep(20)
+    print("Measuring throughput (10s)...", end="", flush=True)
+    time.sleep(10)
     print(" done.\n")
 
     # Second count
