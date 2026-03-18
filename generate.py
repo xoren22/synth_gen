@@ -170,7 +170,7 @@ def _generate_one(seed_i, freq_min, freq_max):
 	return generate_floor_scene(seed=seed_i, freq_min=freq_min, freq_max=freq_max)
 
 
-def _export_one(sample, mask, normals, refl, trans, scene, gidx, pred_t, samples_dir, pbar=None):
+def _export_one(sample, mask, normals, refl, trans, scene, gidx, pred_t, samples_dir, pbar=None, timing=None, extra_meta=None):
 	"""Export a single predicted sample to disk (shared by threaded and sequential modes)."""
 	pred = pred_t.cpu().numpy() if hasattr(pred_t, 'cpu') else np.array(pred_t)
 	sample_name, sample_idx = _reserve_sample_name(samples_dir, gidx)
@@ -204,6 +204,10 @@ def _export_one(sample, mask, normals, refl, trans, scene, gidx, pred_t, samples
 		'canvas': {'width_m': float(canvas.get('width_m', 0.0)), 'height_m': float(canvas.get('height_m', 0.0))},
 		'created_at_unix_s': float(time.time()),
 	}
+	if timing is not None:
+		metadata['timing_s'] = timing
+	if extra_meta is not None:
+		metadata.update(extra_meta)
 	_export_sample_npz_json(samples_dir, sample_name, sample_idx, arrays, metadata)
 	if pbar is not None:
 		pbar.update(1)
@@ -231,6 +235,7 @@ def main():
 	parser.add_argument('--ant_petal_order_max', type=int, default=12, help='Maximum petal count for petal style')
 	parser.add_argument('--ant_db_max', type=float, default=40.0, help='Maximum dB loss in radiation pattern')
 	parser.add_argument('--ant_symmetry_mode', type=str, default='random', choices=['random', 'none', 'x', 'y', 'xy'], help='Symmetry mode; random samples uniformly among none/x/y/xy')
+	parser.add_argument('--max_refl', type=int, default=None, help='Max reflections for ray tracer (default: use approx.MAX_REFL)')
 	parser.add_argument('--verbose', action='store_true', help='Enable detailed per-step timing logs (DEBUG level)')
 	args = parser.parse_args()
 
@@ -256,7 +261,11 @@ def main():
 	os.makedirs(out_dir, exist_ok=True)
 	logging.info(f"Run ID: {run_id}; outputs -> {out_dir}")
 
-	logging.info(f"Processing {N} samples sequentially in one process...")
+	# Resolve max_refl / max_trans
+	from approx import MAX_REFL as DEFAULT_MAX_REFL, MAX_TRANS as DEFAULT_MAX_TRANS
+	max_refl = args.max_refl if args.max_refl is not None else DEFAULT_MAX_REFL
+	max_trans = DEFAULT_MAX_TRANS
+	logging.info(f"Processing {N} samples sequentially in one process... (max_refl={max_refl}, max_trans={max_trans})")
 	model = Approx()
 	samples_dir = out_dir
 	os.makedirs(samples_dir, exist_ok=True)
@@ -302,6 +311,7 @@ def main():
 	t_start = time.perf_counter()
 	for gidx in range(N):
 		seed_i = int(seed_base) + gidx
+		t0 = time.perf_counter()
 		mask, normals, scene, refl, trans, dist = _generate_one(seed_i, args.freq_min, args.freq_max)
 		sample = build_sample_from_generated(
 			mask,
@@ -314,8 +324,12 @@ def main():
 			pattern_cfg=pattern_cfg,
 			pattern_seed=seed_i + 777_777,
 		)
-		pred = model.approximate(sample)
-		_export_one(sample, mask, normals, refl, trans, scene, gidx, pred, samples_dir, pbar)
+		t1 = time.perf_counter()
+		pred = model.approximate(sample, max_refl=max_refl)
+		t2 = time.perf_counter()
+		_export_one(sample, mask, normals, refl, trans, scene, gidx, pred, samples_dir, pbar,
+			timing={'scene_s': round(t1 - t0, 6), 'raytrace_s': round(t2 - t1, 6)},
+			extra_meta={'max_refl': max_refl, 'max_trans': max_trans})
 
 	pbar.close()
 

@@ -44,6 +44,7 @@ DEFAULT_ANT_PETAL_ORDER_MIN = 3
 DEFAULT_ANT_PETAL_ORDER_MAX = 12
 DEFAULT_ANT_DB_MAX = 40.0
 DEFAULT_ANT_SYMMETRY_MODE = "random"
+DEFAULT_MAX_REFL = 5
 
 # ── helpers ──────────────────────────────────────────────────
 
@@ -372,6 +373,8 @@ def cmd_worker(args):
     except Exception:
         pass
 
+    max_refl = int(args.max_refl)
+    max_trans = int(args.max_trans)
     model = Approx()
     update("running", done)  # heartbeat after JIT warmup
     pattern_cfg = RadiationPatternConfig(
@@ -397,6 +400,7 @@ def cmd_worker(args):
         idx = done + i
         seed = args.seed_base + idx
         try:
+            _t0 = time.perf_counter()
             mask, normals, scene, refl, trans, dist = _generate_one(seed, args.freq_min, args.freq_max)
             sample = build_sample_from_generated(
                 mask,
@@ -409,8 +413,12 @@ def cmd_worker(args):
                 pattern_cfg=pattern_cfg,
                 pattern_seed=seed + 777_777,
             )
-            pred = model.approximate(sample)
-            _export_one(sample, mask, normals, refl, trans, scene, idx, pred, out)
+            _t1 = time.perf_counter()
+            pred = model.approximate(sample, max_refl=max_refl, max_trans=max_trans)
+            _t2 = time.perf_counter()
+            _export_one(sample, mask, normals, refl, trans, scene, idx, pred, out,
+                        timing={'scene_s': round(_t1 - _t0, 6), 'raytrace_s': round(_t2 - _t1, 6)},
+                        extra_meta={'max_refl': max_refl, 'max_trans': max_trans})
             completed += 1
             wlog.info(f"Sample {completed}/{target} (seed={seed})")
         except Exception as e:
@@ -427,7 +435,7 @@ def cmd_worker(args):
 
 # ── orchestrator helpers ─────────────────────────────────────
 
-def _launch_worker(run_dir, wid, target, seed_base, fmin, fmax, nt, ant_cfg):
+def _launch_worker(run_dir, wid, target, seed_base, fmin, fmax, nt, ant_cfg, max_refl=DEFAULT_MAX_REFL, max_trans=10):
     wdir = os.path.join(run_dir, "workers", wid)
     os.makedirs(wdir, exist_ok=True)
 
@@ -475,6 +483,8 @@ def _launch_worker(run_dir, wid, target, seed_base, fmin, fmax, nt, ant_cfg):
         "--ant-petal-order-max", str(ant_cfg["ant_petal_order_max"]),
         "--ant-db-max", str(ant_cfg["ant_db_max"]),
         "--ant-symmetry-mode", str(ant_cfg["ant_symmetry_mode"]),
+        "--max-refl", str(max_refl),
+        "--max-trans", str(max_trans),
     ]
     proc = subprocess.Popen(cmd, preexec_fn=_set_parent_death_signal,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -576,6 +586,8 @@ def cmd_start(args):
         fmin = existing.get("freq_min", DEFAULT_FREQ_MIN)
         fmax = existing.get("freq_max", DEFAULT_FREQ_MAX)
         nt = existing.get("numba_threads", DEFAULT_NUMBA_THREADS)
+        max_refl = existing.get("max_refl", DEFAULT_MAX_REFL)
+        max_trans = existing.get("max_trans", 10)
         ant_cfg = {
             "ant_iso_prob": existing.get(
                 "ant_iso_prob",
@@ -607,6 +619,8 @@ def cmd_start(args):
         import numpy as np
         seed = int(np.random.SeedSequence().generate_state(1, dtype=np.uint32)[0])
         fmin, fmax, nt = DEFAULT_FREQ_MIN, DEFAULT_FREQ_MAX, DEFAULT_NUMBA_THREADS
+        max_refl = int(args.max_refl)
+        max_trans = int(args.max_trans)
         ant_cfg = {
             "ant_iso_prob": float(args.ant_iso_prob),
             "ant_latent_dim_min": int(args.ant_latent_dim_min),
@@ -622,6 +636,7 @@ def cmd_start(args):
             "run_dir": rd, "num_workers": nw, "num_samples": total_samples,
             "samples_per_worker": spw, "total_target": total_samples, "global_seed": seed,
             "freq_min": fmin, "freq_max": fmax, "numba_threads": nt,
+            "max_refl": max_refl, "max_trans": max_trans,
             "ant_iso_prob": ant_cfg["ant_iso_prob"],
             "ant_latent_dim_min": ant_cfg["ant_latent_dim_min"],
             "ant_latent_dim_max": ant_cfg["ant_latent_dim_max"],
@@ -688,7 +703,7 @@ def cmd_start(args):
         wid = f"worker_{i:03d}"
         sb = seed + i * spw
         log.info(f"  Starting {wid} (seed_base={sb})")
-        _launch_worker(rd, wid, spw, sb, fmin, fmax, nt, ant_cfg)
+        _launch_worker(rd, wid, spw, sb, fmin, fmax, nt, ant_cfg, max_refl=max_refl, max_trans=max_trans)
 
     # Streamlit
     st_proc = None
@@ -770,7 +785,7 @@ def cmd_start(args):
                     sb = seed + i * spw
                     _clear_inline_progress()
                     log.warning(f"{wid} dead (PID {m.get('pid')}). Restarting...")
-                    _launch_worker(rd, wid, spw, sb, fmin, fmax, nt, ant_cfg)
+                    _launch_worker(rd, wid, spw, sb, fmin, fmax, nt, ant_cfg, max_refl=max_refl, max_trans=max_trans)
 
             _emit_progress(tg, tr, total_samples)
             if all_done:
@@ -1033,6 +1048,8 @@ def main():
     s.add_argument("--ant-petal-order-max", type=int, default=DEFAULT_ANT_PETAL_ORDER_MAX)
     s.add_argument("--ant-db-max", type=float, default=DEFAULT_ANT_DB_MAX)
     s.add_argument("--ant-symmetry-mode", type=str, default=DEFAULT_ANT_SYMMETRY_MODE, choices=["random", "none", "x", "y", "xy"])
+    s.add_argument("--max-refl", type=int, default=DEFAULT_MAX_REFL, help="Max reflections for ray tracer")
+    s.add_argument("--max-trans", type=int, default=10, help="Max transmissions for ray tracer")
 
     s = sub.add_parser("status", help="Print status snapshot")
     s.add_argument("--run-dir", default=None)
@@ -1055,6 +1072,8 @@ def main():
     s.add_argument("--ant-petal-order-max", type=int, default=DEFAULT_ANT_PETAL_ORDER_MAX)
     s.add_argument("--ant-db-max", type=float, default=DEFAULT_ANT_DB_MAX)
     s.add_argument("--ant-symmetry-mode", type=str, default=DEFAULT_ANT_SYMMETRY_MODE, choices=["random", "none", "x", "y", "xy"])
+    s.add_argument("--max-refl", type=int, default=DEFAULT_MAX_REFL)
+    s.add_argument("--max-trans", type=int, default=10)
 
     s = sub.add_parser("dashboard", help="(internal) streamlit UI")
 
